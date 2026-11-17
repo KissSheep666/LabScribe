@@ -1,0 +1,26 @@
+experiment_id: exp-titration
+name: 酸碱滴定标准操作流程
+version: "1.2"
+steps:
+  - id: S1
+    name: 准备滴定仪
+    instruction: 检查滴定管、电极与废液瓶，确认仪器处于待机状态。
+    instrument: instrument-1
+  - id: S2
+    name: 加入样品
+    instruction: 量取 25.0 mL 样品加入锥形瓶，置于滴定台上。
+    instrument: instrument-1
+  - id: S3
+    name: 开始滴定
+    instruction: 记录初始读数，开启搅拌并逐滴滴加标准溶液。
+    instrument: instrument-1
+    expected_reading: { min: 0.0, max: 8.0, unit: mL }
+  - id: S4
+    name: 到达终点
+    instruction: 读数稳定后记录终点体积，停止滴定。
+    instrument: instrument-1
+    expected_reading: { min: 3.0, max: 14.0, unit: mL }
+  - id: S5
+    name: 清洗与复位
+    instruction: 清洗电极，排空滴定管，将仪器复位。
+    instrument: instrument-1

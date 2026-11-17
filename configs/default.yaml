@@ -1,0 +1,80 @@
+app:
+  name: LabScribe
+  data_dir: data
+
+vision:
+  # auto = try the production backend, fall back to the offline backend.
+  # production: yolo11 + bytetrack + paddle   offline: marker + iou + template
+  detector: auto          # auto | yolo11 | marker
+  tracker: auto           # auto | bytetrack | iou
+  ocr: auto               # auto | paddle | template
+  detector_model: yolo11n.pt
+  # Map raw detector class names to pipeline roles (actor | instrument).
+  # A custom instrument model is expected in production; person -> actor.
+  class_map:
+    person: actor
+  object_id_map:
+    instrument: instrument-1
+  display_roi: [0.20, 0.52, 0.80, 0.86]   # relative to an instrument bbox
+  ocr_every_n_frames: 3
+  ocr_min_interval_s: 0.05
+  reading:
+    stable_samples: 3
+    tolerance_abs: 0.25
+    tolerance_rel: 0.01
+    max_gap_s: 2.0
+  confidence:
+    min_detection: 0.45
+    min_ocr: 0.50
+  proximity_margin_px: 70
+  display_occlusion_ratio: 0.30
+
+  source: synthetic        # synthetic | camera | video | images
+  camera_index: 0
+  video_path:
+  image_dir:
+  fps: 10
+  max_frames: 0
+  realtime: false
+
+synthetic:
+  scenario: demo           # demo | eval
+  seed: 7
+  speed: 2.0
+
+events:
+  min_confidence: 0.55
+  session_start_frames: 3
+  session_end_idle_s: 1.2
+  reading_tolerance: 0.4
+  pending_coalesce_s: 2.0
+  limits:
+    instrument-1: { min: 0.0, max: 14.0 }
+
+agent:
+  mode: llm                # llm | rules | off
+  model: deepseek-chat
+  base_url: https://api.deepseek.com
+  temperature: 0.1
+  max_steps: 8
+  timeout_s: 60
+  max_tokens: 900
+  experiment_id: exp-titration
+  sop_dir: data/sop
+  fallback_to_rules: true
+
+store:
+  db_path: data/labscribe.db
+  frames_dir: data/frames
+  max_buffered_frames: 240
+
+api:
+  host: 127.0.0.1
+  port: 8000
+  autostart_runtime: false
+
+eval:
+  dataset_path: data/eval/annotations.jsonl
+  count: 100
+  report_json: reports/eval_report.json
+  report_md: reports/eval_report.md

@@ -1,0 +1,22 @@
+experiment_id: exp-spectro
+name: 分光光度计测定标准操作流程
+version: "1.0"
+steps:
+  - id: S1
+    name: 预热仪器
+    instruction: 开启分光光度计，预热 15 分钟。
+    instrument: instrument-1
+  - id: S2
+    name: 调零
+    instruction: 使用空白参比溶液调零，确认显示为 0.000。
+    instrument: instrument-1
+    expected_reading: { min: 0.0, max: 0.05, unit: Abs }
+  - id: S3
+    name: 测定样品
+    instruction: 依次放入样品比色皿，待读数稳定后记录吸光度。
+    instrument: instrument-1
+    expected_reading: { min: 0.05, max: 2.5, unit: Abs }
+  - id: S4
+    name: 关机清洁
+    instruction: 取出比色皿，清洁样品室并关闭仪器。
+    instrument: instrument-1

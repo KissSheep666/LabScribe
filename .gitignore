@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+data/labscribe.db
+data/labscribe.db-*
+data/frames/
+data/runs/
+data/tmp/
+*.jpg
+*.png
+!docs/**/*.png

@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%231a6c5e'/><text x='32' y='44' font-size='30' font-family='Arial' font-weight='bold' text-anchor='middle' fill='%2337d0b0'>LS</text></svg>" />
+<title>LabScribe · 实验室操作记录 Agent</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --panel-2: #17202b;
+    --line: #253141;
+    --text: #dbe6f2;
+    --muted: #8294a8;
+    --accent: #37d0b0;
+    --accent-2: #f5b64b;
+    --danger: #ff6b6b;
+    --info: #63a4ff;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: radial-gradient(1200px 600px at 80% -10%, #14212b 0%, var(--bg) 55%);
+    color: var(--text); font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 24px;
+    padding: 20px 28px 12px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center;
+    background: linear-gradient(135deg, #123c38, #1a6c5e); border: 1px solid #2b8f7d;
+    color: var(--accent); font-weight: 800; letter-spacing: .5px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .3px; }
+  .sub { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+  .status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .pill {
+    padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--panel); font-variant-numeric: tabular-nums;
+  }
+  .pill.running { border-color: #2b8f7d; color: var(--accent); box-shadow: 0 0 18px #1a6c5e55; }
+  .pill.done { border-color: #3a4a5e; color: #9fb3c8; }
+  .pill.error { border-color: #7a3030; color: var(--danger); }
+
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 0 28px 18px;
+  }
+  .toolbar label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  select, input[type="number"] {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    padding: 8px 10px; border-radius: 9px; font: inherit; outline: none;
+  }
+  input[type="number"] { width: 84px; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    padding: 8px 14px; border-radius: 9px; font: inherit; cursor: pointer; transition: .15s;
+  }
+  button:hover { border-color: #3d566f; transform: translateY(-1px); }
+  button.primary { background: linear-gradient(135deg, #167a6a, #1f9b84); border-color: #2b8f7d; color: #ecfffb; }
+  button.ghost { background: transparent; }
+  button.danger { border-color: #5d2a2a; color: #ffb1b1; }
+  button.small { padding: 5px 10px; font-size: 12px; }
+
+  main {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px; padding: 0 28px 32px;
+  }
+  .card {
+    background: linear-gradient(180deg, #131b25, #101720);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px; min-height: 220px; display: flex; flex-direction: column; gap: 12px;
+    box-shadow: 0 16px 40px #00000030;
+  }
+  .card.span2 { grid-column: span 2; }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .card-head h2 { margin: 0; font-size: 14px; letter-spacing: .4px; }
+  .card-head .hint { color: var(--muted); font-size: 12px; }
+  .scroll { overflow: auto; max-height: 400px; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
+  .scroll::-webkit-scrollbar { width: 8px; }
+  .scroll::-webkit-scrollbar-thumb { background: #26323f; border-radius: 8px; }
+
+  .event, .record, .alert, .run {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: #141d27; border: 1px solid #1e2834; border-radius: 10px; padding: 10px 12px;
+    cursor: pointer; transition: .15s;
+  }
+  .event:hover, .record:hover, .alert:hover, .run:hover { border-color: #35506a; background: #16212d; }
+  .event .body, .record .body, .run .body { flex: 1; min-width: 0; }
+  .event .line1, .record .line1 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .event .reading { font-size: 20px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .event .meta, .record .meta, .run .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .record .note { font-size: 13px; color: #c6d6e6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thumb { width: 92px; height: 62px; object-fit: cover; border-radius: 7px; border: 1px solid #26323f; background: #0d1319; flex: none; }
+  .thumb.tall { width: 100%; height: auto; max-height: 300px; object-fit: contain; }
+
+  .badge {
+    font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid #2b394a;
+    color: #a8bfd6; background: #17222e; white-space: nowrap;
+  }
+  .badge.session_start { color: #7ee0cb; border-color: #286f62; background: #102c28; }
+  .badge.reading_change { color: #ffd479; border-color: #6f5720; background: #2a2211; }
+  .badge.session_end { color: #9db6cf; border-color: #3a4c61; background: #17212c; }
+  .badge.anomaly { color: #ff9c9c; border-color: #7a3434; background: #2a1212; }
+  .badge.critical { color: #ff9c9c; border-color: #7a3434; background: #2a1212; }
+  .badge.warning { color: #ffd479; border-color: #6f5720; background: #2a2211; }
+  .badge.info { color: #9fc3ff; border-color: #34527a; background: #12203a; }
+  .badge.rules { color: #d3b4ff; border-color: #4d3a6e; background: #1f1730; }
+  .badge.llm { color: #7ee0cb; border-color: #286f62; background: #102c28; }
+  .badge.step { color: #9fe3b0; border-color: #2f6b43; background: #10261a; }
+
+  .pending-item {
+    background: #201c14; border: 1px solid #4b3d1f; border-radius: 10px; padding: 12px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .pending-item .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .pending-item .reason { color: #d7bc82; font-size: 12px; }
+  .pending-actions { display: flex; gap: 8px; }
+  .empty { color: var(--muted); font-size: 12px; padding: 18px 4px; }
+
+  .eval-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+  .metric { background: #141d27; border: 1px solid #1e2834; border-radius: 10px; padding: 12px; }
+  .metric .value { font-size: 22px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .metric .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; }
+  .metric.alt .value { color: var(--accent-2); }
+
+  #modal {
+    position: fixed; inset: 0; display: none; place-items: center; padding: 24px;
+    background: #05080cb8; backdrop-filter: blur(4px); z-index: 50;
+  }
+  #modal.open { display: grid; }
+  .modal-box {
+    width: min(980px, 96vw); max-height: 88vh; overflow: auto; background: #101720;
+    border: 1px solid #2a3a4c; border-radius: 16px; padding: 20px; box-shadow: 0 30px 80px #000a;
+  }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .modal-head h3 { margin: 0; font-size: 16px; }
+  .modal-cols { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; }
+  pre {
+    background: #0b1117; border: 1px solid #1e2834; border-radius: 10px; padding: 12px;
+    overflow: auto; font: 12px/1.55 "Cascadia Code", Consolas, monospace; color: #b8cadd;
+    max-height: 420px; white-space: pre-wrap; word-break: break-word;
+  }
+  .kv { color: var(--muted); font-size: 12px; }
+  .kv b { color: var(--text); font-weight: 600; }
+  .steps { display: flex; flex-direction: column; gap: 6px; }
+  .step { background: #141d27; border: 1px solid #1e2834; border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+  .step .tool { color: var(--accent); font-weight: 600; }
+  .step .lat { color: var(--muted); float: right; }
+  a { color: var(--info); text-decoration: none; }
+  @media (max-width: 1100px) {
+    main { grid-template-columns: 1fr; }
+    .card.span2 { grid-column: span 1; }
+    .modal-cols { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">LS</div>
+    <div>
+      <h1>LabScribe</h1>
+      <p class="sub">摄像头 → 稳定事件 → LLM 工具调用 → 可追溯实验记录</p>
+    </div>
+  </div>
+  <div class="status">
+    <span id="statusPill" class="pill">idle</span>
+    <span id="statusMeta">等待运行</span>
+  </div>
+</header>
+
+<section class="toolbar">
+  <label>Agent
+    <select id="agentMode">
+      <option value="llm">LLM (DeepSeek tools)</option>
+      <option value="rules">Rules</option>
+      <option value="off">Off</option>
+    </select>
+  </label>
+  <label>seed <input id="seed" type="number" value="7" min="1" /></label>
+  <label><input id="occluded" type="checkbox" /> 遮挡场景</label>
+  <button id="runDemo" class="primary">运行 Demo</button>
+  <button id="runSeed">运行随机场景</button>
+  <button id="stop" class="danger ghost">停止</button>
+  <span class="hint" id="agentHint" style="color:var(--muted);font-size:12px"></span>
+</section>
+
+<main>
+  <section class="card span2">
+    <div class="card-head">
+      <h2>事件流</h2><span class="hint" id="eventHint">session_start / reading_change / session_end / anomaly</span>
+    </div>
+    <div class="scroll" id="events"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>待确认队列</h2><span class="hint">低置信度观测</span></div>
+    <div class="scroll" id="pending"></div>
+  </section>
+
+  <section class="card span2">
+    <div class="card-head"><h2>实验记录</h2><span class="hint" id="recordHint">点击查看 record → event → frame 追溯链</span></div>
+    <div class="scroll" id="records"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>告警</h2><span class="hint">异常 / 顺序</span></div>
+    <div class="scroll" id="alerts"></div>
+  </section>
+
+  <section class="card span2">
+    <div class="card-head"><h2>Agent 运行</h2><span class="hint">工具调用轨迹</span></div>
+    <div class="scroll" id="runs"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>评测</h2><span class="hint" id="evalHint">100 条人工标注事件</span></div>
+    <div class="eval-grid" id="eval"></div>
+  </section>
+</main>
+
+<div id="modal" onclick="if(event.target===this) closeModal()">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modalTitle">详情</h3>
+      <button class="small" onclick="closeModal()">关闭</button>
+    </div>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+}[c]));
+const fmtTime = (ts) => (ts === null || ts === undefined) ? "—" : Number(ts).toFixed(1) + "s";
+const shortSession = (sid) => sid ? String(sid).replace("sess-", "") .slice(0, 8) : "—";
+
+async function getJSON(url, options) {
+  const res = await fetch(url, options);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (_) {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+function thumb(frameId, cls = "thumb") {
+  if (!frameId) return "";
+  return `<img class="${cls}" loading="lazy" src="/api/frames/${encodeURIComponent(frameId)}" onerror="this.style.visibility='hidden'" alt="" />`;
+}
+
+let lastEvalAt = null;
+
+async function refresh() {
+  try {
+    const [status, events, pending, records, alerts, runs] = await Promise.all([
+      getJSON("/api/status"),
+      getJSON("/api/events?limit=60"),
+      getJSON("/api/pending"),
+      getJSON("/api/records?limit=40"),
+      getJSON("/api/alerts?limit=30"),
+      getJSON("/api/agent/runs?limit=30"),
+    ]);
+    renderStatus(status);
+    renderEvents(events.events);
+    renderPending(pending.pending);
+    renderRecords(records.records);
+    renderAlerts(alerts.alerts);
+    renderRuns(runs.runs);
+  } catch (err) {
+    $("statusPill").textContent = "disconnected";
+    $("statusPill").className = "pill error";
+    $("statusMeta").textContent = err.message;
+  }
+}
+
+function renderStatus(s) {
+  const pill = $("statusPill");
+  pill.textContent = s.running ? "running" : (s.last_error ? "error" : (s.vision_done ? "complete" : "idle"));
+  pill.className = "pill " + (s.running ? "running" : (s.last_error ? "error" : "done"));
+  const parts = [
+    `scenario ${s.scenario_id || "—"}`,
+    `frames ${s.frames_processed}`,
+    `events ${s.events_emitted}`,
+    `agent ${s.agent_mode}`,
+    `queue ${s.agent_queue}`,
+    `elapsed ${s.elapsed_s}s`,
+  ];
+  if (s.last_error) parts.push(`error: ${s.last_error}`);
+  $("statusMeta").textContent = parts.join(" · ");
+  $("agentHint").textContent = `后端: ${s.source} · 评分 ${s.stats?.events ?? 0} 事件 / ${s.stats?.records ?? 0} 记录`;
+  if (s.agent_mode) $("agentMode").value = s.agent_mode;
+}
+
+function renderEvents(events) {
+  const box = $("events");
+  if (!events.length) { box.innerHTML = `<div class="empty">尚无事件。点击「运行 Demo」开始。</div>`; return; }
+  box.innerHTML = events.map((e) => `
+    <div class="event" onclick="showEvent('${esc(e.event_id)}')">
+      <div class="body">
+        <div class="line1">
+          <span class="badge ${esc(e.type)}">${esc(e.type)}</span>
+          <span class="reading">${e.reading === null || e.reading === undefined ? "—" : esc(e.reading)}</span>
+          <span class="badge">${esc(e.object_id)}</span>
+        </div>
+        <div class="meta">t=${fmtTime(e.ts)} · conf ${Number(e.confidence).toFixed(2)} · session ${shortSession(e.session_id)} · ${esc(e.source_frame)}</div>
+      </div>
+      ${thumb(e.source_frame)}
+    </div>`).join("");
+}
+
+function renderPending(items) {
+  const box = $("pending");
+  if (!items.length) { box.innerHTML = `<div class="empty">队列为空（低置信度观测会出现在这里）。</div>`; return; }
+  box.innerHTML = items.map((p) => {
+    const draft = p.draft_event || {};
+    return `<div class="pending-item">
+      <div class="row">
+        <span class="badge ${esc(p.kind)}">${esc(p.kind)}</span>
+        <span class="hint">conf ${Number(p.confidence).toFixed(2)} · t=${fmtTime(p.ts)}</span>
+      </div>
+      <div class="reason">${esc(p.reason || "")}</div>
+      <div class="kv">读数 <b>${esc(draft.reading ?? "—")}</b> · ${esc(p.object_id)} · ${esc(p.source_frame)}</div>
+      ${thumb(p.source_frame, "thumb tall")}
+      <div class="pending-actions">
+        <button class="small primary" onclick="resolvePending('${esc(p.pending_id)}','confirm')">确认</button>
+        <button class="small ghost" onclick="resolvePending('${esc(p.pending_id)}','reject')">拒绝</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderRecords(records) {
+  const box = $("records");
+  if (!records.length) { box.innerHTML = `<div class="empty">尚无记录。Agent 处理事件后会写入结构化记录。</div>`; return; }
+  box.innerHTML = records.map((r) => `
+    <div class="record" onclick="showTrace('${esc(r.record_id)}')">
+      <div class="body">
+        <div class="line1">
+          ${r.step_id ? `<span class="badge step">${esc(r.step_id)}</span>` : `<span class="badge">no step</span>`}
+          <span class="badge">${esc(r.event_id)}</span>
+          <span class="badge">${esc(r.object_id)}</span>
+        </div>
+        <div class="note">${esc((r.note || "").split("\n")[0])}</div>
+        <div class="meta">session ${shortSession(r.session_id)} · record ${esc(r.record_id)} · frame ${esc(r.source_frame)}</div>
+      </div>
+      ${thumb(r.source_frame)}
+    </div>`).join("");
+}
+
+function renderAlerts(alerts) {
+  const box = $("alerts");
+  if (!alerts.length) { box.innerHTML = `<div class="empty">无告警。</div>`; return; }
+  box.innerHTML = alerts.map((a) => `
+    <div class="alert" onclick="${a.event_id ? `showEvent('${esc(a.event_id)}')` : ""}">
+      <div class="body">
+        <div class="line1"><span class="badge ${esc(a.severity)}">${esc(a.severity)}</span></div>
+        <div class="note">${esc(a.message)}</div>
+        <div class="meta">${esc(a.event_id || "—")} · session ${shortSession(a.session_id)}</div>
+      </div>
+    </div>`).join("");
+}
+
+function renderRuns(runs) {
+  const box = $("runs");
+  if (!runs.length) { box.innerHTML = `<div class="empty">尚无 Agent 运行。</div>`; return; }
+  box.innerHTML = runs.map((r) => `
+    <div class="run" onclick="showRun('${esc(r.run_id)}')">
+      <div class="body">
+        <div class="line1">
+          <span class="badge ${esc(r.mode)}">${esc(r.mode)}</span>
+          <span class="badge">${esc(r.event_type || "event")}</span>
+          <span class="badge ${r.status === "completed" || r.status === "fallback_rules" ? "session_start" : "anomaly"}">${esc(r.status)}</span>
+        </div>
+        <div class="meta">${esc(r.run_id)} · ${r.ended ? ((r.ended - r.started) * 1000).toFixed(0) + " ms" : "running"} · ${esc((r.summary || "").slice(0, 90))}</div>
+      </div>
+    </div>`).join("");
+}
+
+async function loadEval() {
+  try {
+    const report = await getJSON("/api/eval/latest");
+    if (lastEvalAt && report.generated_at === lastEvalAt) return;
+    lastEvalAt = report.generated_at;
+    const overall = report.event_metrics.overall;
+    const metrics = [
+      ["事件 recall", overall.recall + "%", ""],
+      ["事件 precision", overall.precision + "%", "alt"],
+      ["F1", overall.f1 + "%", ""],
+      ["OCR 读数准确率", report.ocr.event_reading_accuracy_pct + "%", "alt"],
+      ["遮挡 recall", report.occlusion.recall_pct + "%", ""],
+      ["平均延迟", (report.latency.mean_s ?? 0) + " s", "alt"],
+    ];
+    $("eval").innerHTML = metrics.map(([label, value, cls]) => `
+      <div class="metric ${cls}"><div class="value">${esc(value)}</div><div class="label">${esc(label)}</div></div>`).join("");
+    $("evalHint").textContent = `${report.dataset.scenarios} 场景 / ${report.dataset.gt_events} 标注事件 · ${report.runtime.mean_frame_processing_ms} ms/帧`;
+  } catch (err) {
+    $("eval").innerHTML = `<div class="empty">尚无评测报告：运行 <code>python -m labscribe eval</code>。</div>`;
+  }
+}
+
+// -- actions -----------------------------------------------------------
+async function startRun(payload) {
+  $("statusPill").textContent = "starting…";
+  try {
+    await getJSON("/api/runtime/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    alert("启动失败: " + err.message);
+  }
+  refresh();
+}
+
+$("runDemo").onclick = () => startRun({ scenario: "demo", agent_mode: $("agentMode").value });
+$("runSeed").onclick = () => startRun({
+  seed: Number($("seed").value || 7),
+  occluded: $("occluded").checked,
+  agent_mode: $("agentMode").value,
+});
+$("stop").onclick = async () => { await getJSON("/api/runtime/stop", { method: "POST" }); refresh(); };
+
+async function resolvePending(id, action) {
+  try {
+    await getJSON(`/api/pending/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+  } catch (err) { alert(err.message); }
+  refresh();
+}
+
+// -- modal -------------------------------------------------------------
+function openModal(title, html) {
+  $("modalTitle").textContent = title;
+  $("modalBody").innerHTML = html;
+  $("modal").classList.add("open");
+}
+function closeModal() { $("modal").classList.remove("open"); }
+
+async function showEvent(id) {
+  const data = await getJSON(`/api/events/${encodeURIComponent(id)}`);
+  const e = data.event;
+  openModal(`事件 ${e.event_id}`, `
+    <div class="modal-cols">
+      <div>
+        <div class="kv">类型 <b>${esc(e.type)}</b> · 读数 <b>${esc(e.reading ?? "—")}</b> · 置信度 <b>${Number(e.confidence).toFixed(3)}</b></div>
+        <div class="kv">t=${fmtTime(e.ts)} · session ${esc(e.session_id || "—")} · frame ${esc(e.source_frame)}</div>
+        ${data.frame ? thumb(data.frame.frame_id, "thumb tall") : `<div class="empty">该事件没有持久化画面</div>`}
+      </div>
+      <div>
+        <pre>${esc(JSON.stringify({ event: e, records: data.records, alerts: data.alerts, agent_runs: data.agent_runs.map(r => r.run_id) }, null, 2))}</pre>
+      </div>
+    </div>`);
+}
+
+async function showTrace(id) {
+  const data = await getJSON(`/api/records/${encodeURIComponent(id)}/trace`);
+  const r = data.record, e = data.event;
+  openModal(`记录追溯 ${r.record_id}`, `
+    <div class="kv" style="margin-bottom:12px">追溯链：record → event → frame</div>
+    <div class="modal-cols">
+      <div>
+        ${data.frame ? thumb(data.frame.frame_id, "thumb tall") : `<div class="empty">原始画面不可用</div>`}
+        <div class="kv" style="margin-top:10px">记录 <b>${esc(r.record_id)}</b><br/>
+        步骤 <b>${esc(r.step_id || "—")}</b> · 事件 <b>${esc(r.event_id)}</b><br/>
+        session <b>${esc(r.session_id)}</b> · frame <b>${esc(r.source_frame)}</b></div>
+      </div>
+      <div>
+        <pre>${esc(JSON.stringify({ record: r, event: e }, null, 2))}</pre>
+      </div>
+    </div>`);
+}
+
+async function showRun(id) {
+  const data = await getJSON(`/api/agent/runs/${encodeURIComponent(id)}`);
+  const run = data.run;
+  const steps = (run.steps || []).map((s) => `
+    <div class="step">
+      <span class="lat">${s.latency_ms !== null && s.latency_ms !== undefined ? Number(s.latency_ms).toFixed(0) + " ms" : ""}</span>
+      <span class="badge">${esc(s.kind)}</span>
+      ${s.tool ? `<span class="tool">${esc(s.tool)}</span>` : ""}
+      ${s.content ? esc(s.content.slice(0, 140)) : ""}
+      ${s.result ? `<pre style="margin:8px 0 0;max-height:180px">${esc(JSON.stringify(s.result, null, 2))}</pre>` : ""}
+    </div>`).join("");
+  openModal(`Agent run ${run.run_id}`, `
+    <div class="kv" style="margin-bottom:12px">状态 <b>${esc(run.status)}</b> · 模式 <b>${esc(run.mode)}</b> · 事件 <b>${esc(run.event_id || "—")}</b><br/>
+    总结：${esc(run.summary || "—")}${run.error ? "<br/>错误：" + esc(run.error) : ""}</div>
+    <div class="steps">${steps || `<div class="empty">无步骤</div>`}</div>`);
+}
+
+refresh();
+loadEval();
+setInterval(refresh, 1800);
+setInterval(loadEval, 15000);
+</script>
+</body>
+</html>
