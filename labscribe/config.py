@@ -49,7 +49,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "agent": {
         "mode": "llm",
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "base_url": "https://api.deepseek.com",
         "temperature": 0.1,
         "max_steps": 8,

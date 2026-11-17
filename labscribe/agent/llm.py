@@ -40,7 +40,7 @@ class LLMClient:
     def __init__(self, cfg: Config):
         base_url = str(cfg.get("agent.base_url", "https://api.deepseek.com")).rstrip("/")
         self.endpoint = f"{base_url}/chat/completions"
-        self.model = str(cfg.get("agent.model", "deepseek-chat"))
+        self.model = str(cfg.get("agent.model", "deepseek-flash"))
         self.temperature = float(cfg.get("agent.temperature", 0.1))
         self.timeout = float(cfg.get("agent.timeout_s", 60))
         self.max_tokens = int(cfg.get("agent.max_tokens", 900))

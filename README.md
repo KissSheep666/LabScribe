@@ -22,6 +22,7 @@ LabScribe 从摄像头画面中识别仪器、操作者与数字显示读数，�
 - [Agent 工具与循环](#agent-工具与循环)
 - [可追溯性](#可追溯性)
 - [评测](#评测)
+- [相关方案调研](#相关方案调研)
 - [生产视觉后端](#生产视觉后端)
 - [配置](#配置)
 - [测试](#测试)
@@ -141,7 +142,9 @@ $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"   # 可选
 > 若未配置或请求失败，Agent 会自动回退到确定性的规则 Agent，并在运行记录中明确标注
 > `fallback_rules`，不会中断记录流程。
 
-已验证：DeepSeek `deepseek-chat` 的 tool calling 可正常驱动 8 个工具完成完整 Demo。
+已验证：`deepseek-flash`（DeepSeek-V4.1-Flash，1M context）的 tool calling 可正常驱动 8 个工具完成完整 Demo；
+该模型还支持 **图片输入**，可直接对原始帧做 VLM 二次判读（本项目尚未默认启用，见调研文档的 P0 路线）。
+`deepseek-v4-pro` 仅支持文本。
 
 ---
 
@@ -258,7 +261,7 @@ Dashboard 每 1.8s 轮询：事件卡片带缩略图，点击查看事件详情�
 LLM 循环（`agent/loop.py`）：
 
 1. 构造 system prompt（角色 + SOP + 硬约束）与 user prompt（事件 + 会话上下文 + **确定性规划建议**）；
-2. 调用 `deepseek-chat`（或任意兼容端点），可连续多轮 tool calls；
+2. 调用 `deepseek-flash`（或任意兼容端点），可连续多轮 tool calls；
 3. 每个工具调用/结果/耗时写入 `agent_steps`，可完整回放；
 4. 达到 `max_steps` 或模型给出最终答复即结束；
 5. **规划建议**由同一套确定性规则生成（当前步骤、读数范围检查、建议的 validate/write/advance/alert 顺序），
@@ -331,6 +334,24 @@ GET /api/records/{record_id}/trace  →  {record, event, frame{url}, agent_runs,
 
 ---
 
+## 相关方案调研
+
+完整快照与链接见 [`docs/related-work.md`](docs/related-work.md)。最接近的项目与差异：
+
+| 项目 | 最接近的部分 | 与本项目的差异 |
+| --- | --- | --- |
+| [MannLabs/proteomics_lab_agent](https://github.com/MannLabs/proteomics_lab_agent) | 多模态实验室 Agent、MCP 工具、从视频生成协议 | 面向蛋白质组学知识/仪器 QC，无实时事件流与帧级追溯 |
+| [NVIDIA/sop-monitoring-blueprints](https://github.com/NVIDIA/sop-monitoring-blueprints) | VLM + 时序分割做 SOP 监控 | 重模型微调/DeepStream，不做逐事件工具调用与实验记录 |
+| [KRATSZ/LabScript-AI](https://github.com/KRATSZ/LabScript-AI) | Agent + 运行时感知 + allow/ask/suspend 安全门禁 | 面向移液机器人执行与恢复，不做 SOP 记录与审计 |
+| [zbbio/lab-robot](https://github.com/zbbio/lab-robot) | MCP 相机 + 云端 VLM 问答 + Opentrons | 无事件折叠、稳定读数、待确认队列与评测 |
+| [zaixizhang/LabOS](https://github.com/zaixizhang/LabOS) | 多 Agent、98 工具、多模态感知/XR | 干实验 Co-Scientist，不覆盖摄像头事件流 |
+| [ChemCrow](https://github.com/ur-whitelab/chemcrow-public) / [Coscientist](https://github.com/gomesgroup/coscientist) | LLM 工具调用驱动化学实验 | 无视觉、仪器读数与可追溯记录 |
+
+结论：各段都有成熟方案，但**「稳定读数 → 离散事件 → 工具调用 → 帧级追溯 + 可复现评测」的闭环**未发现完全相同的开源实现。
+优先建议：用 Flash 的图片能力做低置信度帧的 VLM 二次判读、把相机/事件/记录 MCP 化、给记录标注证据等级并对接 ELN。
+
+---
+
 ## 生产视觉后端
 
 ```powershell
@@ -389,6 +410,7 @@ events:
   reading_tolerance: 0.4
   limits: { instrument-1: { min: 0.0, max: 14.0 } }
 agent:
+  model: deepseek-flash
   max_steps: 8
   fallback_to_rules: true
 ```

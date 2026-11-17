@@ -69,7 +69,7 @@ def test_chat_with_mock_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("LABSCRIBE_LLM_API_KEY", "test-key")
     cfg = Config.load(
         overrides={
-            "agent": {"base_url": "https://example.invalid", "model": "deepseek-chat"},
+            "agent": {"base_url": "https://example.invalid", "model": "deepseek-flash"},
             "store": {"db_path": str(tmp_path / "x.db")},
         }
     )
@@ -99,7 +99,7 @@ def test_chat_with_mock_transport(monkeypatch, tmp_path):
     )
     assert response.content == "已记录。"
     assert captured["auth"] == "Bearer test-key"
-    assert captured["body"]["model"] == "deepseek-chat"
+    assert captured["body"]["model"] == "deepseek-flash"
     assert captured["body"]["tool_choice"] == "auto"
     assert captured["body"]["tools"][0]["function"]["name"] == "x"
     client.close()
