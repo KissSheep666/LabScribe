@@ -13,3 +13,4 @@ data/tmp/
 *.jpg
 *.png
 !docs/**/*.png
+!docs/**/*.jpg

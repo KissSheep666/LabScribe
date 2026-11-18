@@ -23,6 +23,7 @@ LabScribe 从摄像头画面中识别仪器、操作者与数字显示读数，�
 - [可追溯性](#可追溯性)
 - [评测](#评测)
 - [相关方案调研](#相关方案调研)
+- [原理解析文档](#原理解析文档)
 - [生产视觉后端](#生产视觉后端)
 - [配置](#配置)
 - [测试](#测试)
@@ -349,6 +350,24 @@ GET /api/records/{record_id}/trace  →  {record, event, frame{url}, agent_runs,
 
 结论：各段都有成熟方案，但**「稳定读数 → 离散事件 → 工具调用 → 帧级追溯 + 可复现评测」的闭环**未发现完全相同的开源实现。
 优先建议：用 Flash 的图片能力做低置信度帧的 VLM 二次判读、把相机/事件/记录 MCP 化、给记录标注证据等级并对接 ELN。
+
+---
+
+## 原理解析文档
+
+想弄懂内部原理与完整链路，看这两份（内容相同，HTML 为简洁易读的单页版）：
+
+- Markdown：[`docs/architecture.md`](docs/architecture.md)
+- HTML：[`docs/architecture.html`](docs/architecture.html)（直接双击打开即可）
+
+内容包括：贯穿全文的类比、五层架构逐层拆解与核心代码、读数 7.2 的真实运行旅程（含原始帧）、
+异常链路、评测口径、设计取舍 FAQ（8 问）、代码地图与扩展方式。
+
+重新生成 HTML：
+
+```powershell
+python scripts/build_docs.py
+```
 
 ---
 
