@@ -122,37 +122,7 @@ LabScribe 做一件事：**把摄像头里的"人在用仪器做实验"自动变
 
 关键点：**视觉线程和 Agent 线程解耦**。LLM 一次要 2–4 秒，画面不能停；所以视觉侧只管往队列里丢事件，Agent 侧慢慢处理。Demo 里 140 帧只处理了约 1.4 秒（不含 LLM），8 个事件全部正确入队。
 
-```python
-# labscribe/runtime.py（节选）
-def _vision_loop(self, source, pipeline: VisionPipeline) -> None:
-    ...
-    for frame in source.iter_frames():
-        if self._stop.is_set():
-            break
-        self.frame_store.keep(frame)                     # 环形缓冲，供追溯
-        observations = pipeline.process(frame)           # ① 视觉
-        for event in self.processor.handle_observations(observations):  # ② 事件
-            self.agent_queue.put(event)                  # 传送带：不阻塞
-            self.events_emitted += 1
-            self.bus.publish("observation_event", event.to_dict())
-        self.frames_processed += 1
-    ...
-    self.agent_queue.put_nowait(None)                    # 收尾信号
-
-def _agent_loop(self) -> None:
-    while True:
-        try:
-            item = self.agent_queue.get(timeout=0.25)    # ③ Agent 慢慢消费
-        except queue.Empty:
-            if self._vision_done.is_set() or self._stop.is_set():
-                break
-            continue
-        if item is None:
-            ...
-            break
-        result = self.agent.handle_event(item)
-        self.bus.publish("agent", result.to_dict())
-```
+两条循环的骨架只有三行：视觉线程 `agent_queue.put(event)`，Agent 线程 `agent_queue.get()`，结束时放一个 `None` 作为收尾信号。
 
 ---
 
@@ -172,21 +142,7 @@ def _agent_loop(self) -> None:
 
 ### 3.2 检测与跟踪：谁在看哪台仪器
 
-```python
-# labscribe/vision/pipeline.py
-def process(self, frame: Frame) -> list[Observation]:
-    raw = self.detector.detect(frame)
-    detections = self.tracker.update(
-        [d for d in raw if d.confidence >= self.min_detection]
-    )
-    actors = [d for d in detections if d.label == "actor"]
-    instruments = [d for d in detections if d.label == "instrument"]
-    observations: list[Observation] = []
-    for inst in instruments:
-        observations.append(self._observe(frame, inst, actors))
-    self.last_observations = observations
-    return observations
-```
+视觉层的主循环只有三步：`detector.detect(frame)` 拿到检测框 → `tracker.update(...)` 给每个目标贴上稳定 ID → 按角色分成 `actor` 人和 `instrument` 仪器，逐个生成观测。
 
 - `Detector`：生产环境是 YOLO11，离线是 `MarkerDetector`（颜色标记）。角色只有两种：`actor`（人/手）和 `instrument`（仪器）。分类映射在 `vision.class_map`。
 - `Tracker`：生产环境 ByteTrack，离线是 IoU 跟踪器。它保证同一台仪器在连续帧里拿到**稳定的 track_id**，不会一会 `instrument-1` 一会 `instrument-2`。
@@ -196,75 +152,47 @@ def process(self, frame: Frame) -> list[Observation]:
 
 ### 3.3 显示区裁剪 + OCR 节流 + 遮挡
 
-```python
-# labscribe/vision/pipeline.py（_observe 节选）
-display_roi = self._display_roi(inst)
-state = self._state(object_id)
-
-closest_actor = self._closest_actor(inst, actors)
-actor_present = closest_actor is not None
-
-occluded = False
-if closest_actor is not None:
-    occluded = closest_actor.bbox.coverage(display_roi) >= self.occlusion_ratio
-
-due_ocr = (
-    not occluded
-    and frame.index - state.last_ocr_frame >= self.ocr_every_n
-    and frame.ts - state.last_ocr_ts >= self.ocr_min_interval
-)
-if due_ocr:
-    result = self.ocr.read(frame.image, display_roi)
-    ...
-elif occluded:
-    stable = state.stabilizer.update(frame.ts, None, 0.0)   # 遮挡=没看到，不是读数 0
-    state.stable_now = False
-    state.stable_value = None
-```
-
-三个设计点：
+每个观测做四件事，顺序很重要：**先判遮挡 → 再决定要不要 OCR → 只裁显示区 → 节流**。
 
 1. **只裁显示区**：整帧 OCR 又慢又容易读到标签文字（TITRATOR）。显示区按仪器框的固定比例裁剪（`vision.display_roi = [0.20, 0.52, 0.80, 0.86]`）。
 2. **按帧节流**：`ocr_every_n_frames=3`，10 fps 下每 0.3 秒读一次。OCR 是整条视觉链路最贵的一步。
 3. **遮挡 ≠ 0**：手挡住时传 `None`，而不是 `0.0`。这很重要——如果传 0，状态机会认为"读数变成 0 了"，写出一条假记录。传 `None` 表示"这一帧没有可信观测"。
+4. **遮挡判定**：人框覆盖显示区 ≥ 30% 就不读，不做"猜一个"。
 
 > **类比：实习生被手挡住时会说"没看清"，而不是"我看到 0"。**
 
 ### 3.4 读数稳定器（本项目最巧的一小段代码）
 
+这是全项目最值得看的一段代码，因为它决定了"什么才算一个可信的事实"。
+
 ```python
-# labscribe/vision/stability.py
-def update(self, ts: float, value: float | None, confidence: float = 1.0) -> StableReading:
+# labscribe/vision/stability.py（核心逻辑，已省略 dataclass 样板）
+def update(self, ts, value, confidence=1.0) -> StableReading:
+    # 1. 断档太久：旧基线作废
     if self._last_ts is not None and ts - self._last_ts > self.max_gap_s:
         self._samples.clear()
         self._last_stable = None
-        ...
     self._last_ts = ts
 
+    # 2. 空帧/遮挡：保留旧值，但标记"不新鲜"
     if value is None or confidence <= 0:
-        return StableReading(value=self._last_stable, ..., stable=False, changed=False)
+        return StableReading(self._last_stable, stable=False, changed=False)
 
-    self._samples.append((float(ts), float(value), float(confidence)))
-    self._samples = [s for s in self._samples if s[0] >= ts - self.max_gap_s]
-
+    self._samples.append((ts, value, confidence))
     if len(self._samples) < self.stable_samples:
         return StableReading(..., stable=False)
 
-    window = self._samples[-self.stable_samples :]
-    values = [s[1] for s in window]
+    # 3. 最近 N 个样本是否一致（相对容差，随量程放大）
+    values = [s[1] for s in self._samples[-self.stable_samples:]]
     mean = sum(values) / len(values)
-    spread = max(values) - min(values)
     tolerance = self.tolerance_abs + self.tolerance_rel * abs(mean)
-    if spread > tolerance:
-        return StableReading(..., stable=False)     # 还在跳，不认
+    if max(values) - min(values) > tolerance:
+        return StableReading(..., stable=False)      # 还在跳，不认
 
-    stable_value = values[-1]
-    changed = False
-    if self._last_stable is None or abs(stable_value - self._last_stable) > tolerance:
-        changed = self._last_stable is not None      # 第一次稳定不算"变化"
-        self._last_stable = stable_value
-        ...
-    return StableReading(value=self._last_stable, stable=True, changed=changed)
+    # 4. 与上次稳定值比较，跃变只报一次
+    changed = self._last_stable is not None and abs(values[-1] - self._last_stable) > tolerance
+    self._last_stable = values[-1]
+    return StableReading(self._last_stable, stable=True, changed=changed)
 ```
 
 逐条翻译：
@@ -313,42 +241,11 @@ tolerance = tolerance_abs + tolerance_rel × |mean|
 
 状态机就是那个"剪辑师"。它每个观测只做很少的判断，但因为有**记忆**（`_ObjectState`），所以能识别出"一段连续行为"。
 
-```python
-@dataclass
-class _ObjectState:
-    phase: str = "idle"                   # idle / active
-    session_id: str | None = None         # 当前会话
-    interact_frames: int = 0              # 连续"有人在操作"的帧数
-    last_interact_ts: float | None = None # 最后一次看到人的时间
-    last_reading: float | None = None     # 上一次稳定读数
-    last_anomaly_reading: float | None = None
-```
+这份记忆只有六个字段，值得记住：`phase`（idle/active）、`session_id`、`interact_frames`（连续看见人的帧数）、`last_interact_ts`（最后一次看到人的时间）、`last_reading`（上一次稳定读数）、`last_anomaly_reading`（上次告警的超限值，用来去重）。
 
 ### 4.2 会话开始：连续 N 帧才算
 
-```python
-# labscribe/events/state_machine.py
-def _session_transitions(self, obs, state, out):
-    if obs.action == "interacting":
-        if state.phase == "idle":
-            state.interact_frames += 1
-            if state.interact_frames >= self.start_frames:
-                state.phase = "active"
-                state.session_id = new_id("sess")
-                state.last_interact_ts = obs.ts
-                ...
-                out.events.append(self._event("session_start", obs, obs.confidence, ...))
-        else:
-            state.interact_frames = 0
-            state.last_interact_ts = obs.ts
-    else:
-        state.interact_frames = 0
-        if (state.phase == "active"
-                and obs.ts - state.last_interact_ts >= self.end_idle_s):
-            out.events.append(self._event("session_end", obs, obs.confidence, ...))
-            state.phase = "idle"
-            state.session_id = None
-```
+规则：`idle` 状态下，连续 `session_start_frames=3` 帧检测到人在操作，才切到 `active` 并发 `session_start`；`interacting` 期间不断刷新 `last_interact_ts`；一旦超过 `session_end_idle_s=1.2` 秒没有交互，发 `session_end` 并回到 `idle`。
 
 - `session_start_frames=3`：路过镜头、误检、单帧闪烁都不会触发"开始实验"。
 - `session_end_idle_s=1.2`：人离开 1.2 秒才判定结束。短暂转身拿东西不算结束。
@@ -357,18 +254,7 @@ def _session_transitions(self, obs, state, out):
 
 ### 4.3 读数变更：带"上一次值"的证据
 
-```python
-if obs.reading_stable and obs.reading is not None:
-    if state.last_reading is None:
-        state.last_reading = obs.reading          # 建立基线，不发事件
-    elif abs(obs.reading - state.last_reading) > self.reading_tol:
-        event = self._event(
-            "reading_change", obs, effective, reading=obs.reading,
-            meta={"previous_reading": state.last_reading, ...},
-        )
-        out.events.append(event)
-        state.last_reading = obs.reading
-```
+规则：稳定读数与 `last_reading` 相差超过 `reading_tol` 时才发事件，并把旧值写进 `meta.previous_reading`；第一次拿到稳定读数只建立基线，不发事件。
 
 注意事件里带了 `previous_reading`。这不是装饰——Agent 写记录时可以直接引用"3.5 → 7.2"，人工复核也一眼能看出改了哪一栏。
 
@@ -379,75 +265,24 @@ if obs.reading_stable and obs.reading is not None:
 - `reading_change` 是"发生了什么"；
 - `anomaly` 是"这件事是否违规"。
 
-```python
-limits = self.limits.get(obs.object_id)         # 例如 instrument-1: [0, 14]
-if limits and obs.reading is not None and effective >= 0.3:
-    low, high = float(limits.get("min", 0.0)), float(limits.get("max", 1e9))
-    if obs.reading < low or obs.reading > high:
-        already_flagged = (
-            state.last_anomaly_reading is not None
-            and abs(obs.reading - state.last_anomaly_reading) <= self.reading_tol
-        )
-        if not already_flagged:
-            ...
-            out.events.append(self._event("anomaly", obs, effective, reading=obs.reading, meta=meta))
-            state.last_anomaly_reading = obs.reading
-```
-
-`already_flagged` 保证同一个超限值不会每帧告警一次。
+规则：读数超出 `events.limits` 的 `[min, max]` 时发 `anomaly`；用 `last_anomaly_reading` 记住上一次告警的值，同一个超限值不会每帧告警一次；读数回到范围内再清除该记录。
 
 ### 4.5 置信度取"最小值"（容易忽略的细节）
-
-```python
-reading_conf = obs.reading_confidence if obs.reading_confidence is not None else 1.0
-effective = min(detection_conf, float(reading_conf))
-
-if detection_conf >= self.min_conf:
-    self._session_transitions(obs, state, out)
-else:
-    ...  # 只累积候选，不改状态
-```
 
 一次观测有两份置信度：
 
 - 检测置信度：**仪器**认得准不准；
 - OCR 置信度：**读数**读得准不准。
 
-取 `min` 意味着：**仪器检测很准但数字读糊了，也不能算可信。**
+两者取 `min` 作为有效置信度。意味着：**仪器检测很准但数字读糊了，也不能算可信。**
 
 > **类比：双人签字。** 会计和出纳都签字才能付款；任何一个人说"我看不清"，这笔账就挂起。
 
 ### 4.6 低置信度 → 待确认队列
 
-```python
-# 低置信度不会改变状态，只累积"候选"
-if detection_conf >= self.min_conf:
-    self._session_transitions(obs, state, out)
-else:
-    if obs.action == "interacting" and state.phase == "idle":
-        state.interact_frames += 1          # 证据仍要累积
-    ...
-    candidate = self._session_candidate(obs, state)
-    if candidate is not None:
-        out.pending.append(candidate)
-```
+门禁规则很简单：**置信度低于 `events.min_confidence` 时，不改状态机状态，只把候选写入 `pending` 表。**
 
 为什么"不改状态、只累积证据"？因为置信度低时仍然可能有 3 帧连续的弱信号。如果直接丢弃，第二天的模糊场景就会漏记。现在它会被放进 `pending` 表，Dashboard 上人工点一下"确认"，就会生成一个 `human_confirmed` 事件，并**继续交给 Agent 写记录**。
-
-```python
-# labscribe/events/processor.py
-def confirm_pending(self, pending_id: str) -> dict[str, Any] | None:
-    item = self.db.get_pending(pending_id)
-    if item is None or item.get("status") != "open":
-        return None
-    event = LabEvent.from_dict(item["draft_event"])
-    event.event_id = new_event_id()
-    event.status = "human_confirmed"
-    event.meta["confirmed_from_pending"] = True
-    self.record_event(event)
-    self.db.resolve_pending(pending_id, "confirmed")
-    return {"pending_id": pending_id, "status": "confirmed", "event": event.to_dict()}
-```
 
 > **类比：收银台的"待核筐"。** 扫不清的商品先放一边，不影响后面结账；人工确认后补扫，账照样完整。
 
@@ -487,19 +322,9 @@ Vision thread ──► queue.Queue ──► Agent thread
 
 如果同步处理，摄像头会卡成幻灯片。解耦后，视觉侧 140 帧 1.4 秒跑完，Agent 侧按自己的节奏消化 8 个事件。
 
-线程安全收尾也做了：
-
-```python
-def stop(self, timeout: float = 5.0) -> dict[str, Any]:
-    self._stop.set()
-    self.agent_queue.put_nowait(None)
-    for thread in (self._vision_thread, self._agent_thread):
-        if thread and thread.is_alive():
-            thread.join(timeout=timeout)
-    ...
-```
-
-每次 `start()` 重建 `RuleStateMachine` 和 `EventProcessor`，避免上一次运行的会话状态串到下一次（有专门测试 `test_runtime_can_rerun_a_scenario_without_state_bleed`）。
+收尾也很直接：`stop()` 先置停止标志，往队列塞一个 `None` 唤醒 Agent 线程，再带超时 join 两条线程。
+另外每次 `start()` 都会重建 `RuleStateMachine` 和 `EventProcessor`，避免上一次运行的会话状态串到下一次
+（有专门测试 `test_runtime_can_rerun_a_scenario_without_state_bleed`）。
 
 ---
 
@@ -576,40 +401,12 @@ Planner guidance (deterministic, derived from the SOP):
 | `get_recent_events` | 读 | limit 上限 |
 | `get_session_context` | 读 | — |
 
-**最重要的门禁：`write_experiment_record` 不允许模型提供帧号。**
+**最重要的门禁：`write_experiment_record` 不允许模型提供帧号和读数。**
 
-```python
-# labscribe/agent/tools.py
-event_id = str(args["event_id"])
-event = self.db.get_event(event_id)
-if event is None:
-    return {"ok": False, "error": f"event_id not found: {event_id}"}
-...
-record = ExperimentRecord(
-    record_id=new_id("rec"),
-    experiment_id=str(args["experiment_id"]),
-    session_id=event.get("session_id") or ctx.session_id() or "adhoc",
-    step_id=step_id,
-    event_id=event_id,
-    source_frame=event.get("source_frame") or "",     # ← 从数据库反查，不信模型
-    object_id=event.get("object_id") or "",
-    reading=event.get("reading"),                      # ← 同样反查
-    ...
-)
-dedupe_key = f"{event_id}|{step_id or '-'}"
-saved, created = self.db.save_record(record, dedupe_key)
-return {
-    "ok": True,
-    "created": created,
-    "deduped": not created,
-    "record_id": saved.get("record_id"),
-    "source_frame": saved.get("source_frame"),
-    "frame_url": f"/api/frames/{saved.get('source_frame')}" if saved.get("source_frame") else None,
-    ...
-}
-```
+模型只能给一个 `event_id`。工具拿它去库里查事件，查不到直接报错；查到了就**用事件里的真实字段**填记录
+（`source_frame`、`reading`、`object_id` 全部反查），并用 `event_id|step_id` 作为幂等键。
 
-这消灭了整类问题：**模型幻觉出一条"读数 99，帧 abc.jpg"的记录是不可能的**——工具会拿 `event_id` 去库里查，查不到就报错；查到了就用事件里的真实读数与真实帧。
+这段逻辑只有几行，但消灭了整类问题：**模型幻觉出一条"读数 99，帧 abc.jpg"的记录是不可能的**。
 
 > **类比：报销单系统。** 你只要填"行程编号"，金额和发票照片由系统从订单里自动带出，不给你手填的机会。
 
@@ -617,30 +414,7 @@ return {
 
 ### 6.5 LLM 循环
 
-```python
-# labscribe/agent/loop.py（节选）
-messages = [
-    {"role": "system", "content": self._system_prompt()},
-    {"role": "user", "content": f"Event:\n{...}\n\nSession context:\n{...}\n\n"
-                                f"Planner guidance (deterministic, derived from the SOP):\n{...}"},
-]
-for _ in range(self.max_steps):                      # 默认 8 步，防死循环
-    response = self.llm.chat(messages, tools=self.tools.schemas())
-    logger.log("assistant", content=response.content, latency_ms=response.latency_ms,
-               result={"tool_calls": [tc.name for tc in response.tool_calls]})
-    if not response.tool_calls:
-        return AgentResult(run_id, "completed", "llm", response.content, event.event_id, ...)
-    messages.append({"role": "assistant", "content": response.content or "",
-                     "tool_calls": response.raw_tool_calls})
-    for call in response.tool_calls:
-        if call.error:
-            result = {"ok": False, "error": call.error}
-            logger.log("tool", tool=call.name, arguments=call.arguments, result=result)
-        else:
-            result = logger.call(self.tools, call.name, call.arguments, ctx)
-        messages.append({"role": "tool", "tool_call_id": call.id,
-                         "content": json.dumps(result, ensure_ascii=False, default=str)})
-```
+循环骨架很短：把 system prompt、事件、会话上下文、规划建议组成 messages，最多跑 `max_steps=8` 轮；每一轮把模型的 tool_calls 逐个执行，把结果以 `role="tool"` 追加回 messages；模型不再要求调用工具时结束。
 
 一个事件通常 1–3 轮：第 1 轮并发发出"校验顺序 + 校验读数"；第 2 轮写记录并推进步骤；第 3 轮给结束语。实测单事件 2.0–3.9 秒。
 
@@ -648,38 +422,14 @@ for _ in range(self.max_steps):                      # 默认 8 步，防死循�
 
 > **类比：书记员请假，代理书记员照着模板继续写。**
 
-```python
-try:
-    if self.mode == "llm":
-        result = self._run_llm(event, run_id, ctx, logger)
-    else:
-        result = self._run_rules(event, run_id, ctx, logger)
-except LLMError as exc:
-    if self.mode == "llm" and self.fallback_to_rules:
-        result = self._run_rules(event, run_id, ctx, logger)
-        result.status = "fallback_rules"
-        result.summary = f"LLM 不可用，已回退到规则 Agent：{exc}"
-        result.error = str(exc)
-```
-
-触发条件包括：没 key、超时、429/5xx（带 2 次重试后）。运行记录里 `status=fallback_rules`，能一眼看出这条记录不是 LLM 写的。
+逻辑只有一层 try/except：LLM 模式下抛 `LLMError`（没 key、超时、429/5xx 重试后仍失败）且允许回退时，改用规则 Agent 跑完，并把状态标成 `fallback_rules`。运行记录里一眼能看出这条记录不是 LLM 写的。
 
 ### 6.7 安全网：保证"每条事件都有台账"
 
-```python
-def _ensure_traceability(self, event, ctx, logger) -> None:
-    if self.db.record_for_event(event.event_id) is None:
-        logger.call(self.tools, "write_experiment_record", {
-            "experiment_id": self.experiment_id,
-            "event_id": event.event_id,
-            "summary": f"自动补录：{self._rule_summary(event)}",
-            "note": "safety net: agent did not write a record",
-        }, ctx)
-    if event.type == "anomaly" and not self.db.alerts_for_event(event.event_id):
-        logger.call(self.tools, "raise_alert", {"severity": "critical", ...}, ctx)
-```
+Agent 回合结束后无条件检查一次：该事件有没有记录？没有就补一条，summary 前缀写"自动补录："；anomaly 有没有告警？没有就补一条 critical。补写也会写进 `agent_steps`，明确标注 `safety net`。
 
-无论 LLM 返回什么、是否报错，**每条事件最终至少有一条记录**；anomaly 最终至少有一条告警。这不是为了"掩盖失败"，而是为了让审计链不断裂——补写会明确标注 `safety net`。
+无论 LLM 返回什么、是否报错，**每条事件最终至少有一条记录**；anomaly 最终至少有一条告警。
+这不是为了"掩盖失败"，而是为了让审计链不断裂。
 
 ---
 
@@ -701,33 +451,9 @@ def _ensure_traceability(self, event, ctx, logger) -> None:
 
 > **类比：监控录像不会永远保留，但"事故片段"要永久保留。**
 
-7×24 摄像头一天几十万帧，全存会撑爆磁盘。`FrameStore` 用内存环形缓冲（默认 240 帧）保住最近画面，只有**被事件或待确认项引用**时才写 JPEG：
-
-```python
-# labscribe/store/frames.py
-def keep(self, frame: Frame) -> None:
-    self._buffer[frame.frame_id] = frame
-    self._buffer.move_to_end(frame.frame_id)
-    while len(self._buffer) > self.max_buffered:
-        self._buffer.popitem(last=False)
-
-def persist(self, frame_id: str) -> str | None:
-    if not frame_id:
-        return None
-    cached = self._persisted.get(frame_id)
-    if cached:
-        return cached
-    frame = self._buffer.get(frame_id)
-    if frame is None:
-        row = self.db.get_frame(frame_id)
-        return row["path"] if row else None
-    path = self.frames_dir / f"{frame_id}.jpg"
-    if not path.exists():
-        cv2.imwrite(str(path), frame.image, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
-    self.db.save_frame(frame_id=frame_id, path=str(path), ts=frame.ts, ...)
-    self._persisted[frame_id] = str(path)
-    return str(path)
-```
+7×24 摄像头一天几十万帧，全存会撑爆磁盘。`FrameStore` 用内存环形缓冲（默认 240 帧）保住最近画面，
+只有**被事件或待确认项引用**时才写 JPEG。所以磁盘上永远只有"被引用过的那些帧"，数量级等于事件数，
+而不是帧数。记录里存的是 `frame_id`，取图时先查缓冲、再查数据库索引，找不到就是这帧从未被引用。
 
 ### 7.3 追溯链：一条命令回到原始画面
 
@@ -774,7 +500,7 @@ GET /api/records/{record_id}/trace
 
 > 这张图就是 `data/frames/demo-00098.jpg`，也是 `/api/records/rec-311db1546459/trace` 返回的那一帧。
 
-### 异常链路（同一 Demo 的 15.2）
+### 8.1 异常链路（同一 Demo 的 15.2）
 
 ```text
 事件:     {"type": "anomaly", "reading": 15.2, "source_frame": "demo-00116"}
@@ -919,21 +645,15 @@ SOP:      completed=["S1","S2","S3"], next="S4"   ← 超限，S4 拒绝推进
 
 ### 9.5 匹配规则（事件是"有时间的离散点"，不能直接算准确率）
 
-```text
-对每条标注：
-   在同类型、未被使用的预测里，优先找落在 window 内的
-   取时间最接近的那条，一对一匹配
-   窗口外 = 漏检（FN）；没被匹配的预测 = 误报（FP）
-```
+对每条标注，在同类型、未被使用的预测里找落在 `window` 内的，取时间最接近的一条，一对一匹配。
+窗口外算漏检（FN），没被匹配的预测算误报（FP）。
 
 为什么不能只看"总分对/总分错"？因为事件有**时间容差**：早 0.3 秒和晚 0.3 秒都是对的；
-而漏掉一个、多报一个，是两个不同的错误。所以用 TP / FP / FN：
+而漏掉一个、多报一个，是两个不同的错误。所以用 TP / FP / FN 三个量：
 
-```text
-precision = TP / (TP + FP)     报出来的事件里，有多少是真的
-recall    = TP / (TP + FN)     真事件里，有多少被报出来了
-F1        = 2PR / (P + R)      两者的调和平均
-```
+- `precision = TP / (TP + FP)`：报出来的事件里，有多少是真的；
+- `recall = TP / (TP + FN)`：真事件里，有多少被报出来了；
+- `F1`：两者的调和平均。
 
 延迟 = 预测时刻 − 标注时刻，锚定**物理变化时刻**，所以能真实反映"系统多久才确认"（含稳定化等待）。
 
@@ -968,12 +688,6 @@ F1        = 2PR / (P + R)      两者的调和平均
 | 帧处理耗时 | 1.43 ms/帧 |
 
 两套数字几乎一致，说明结果不是"记住了这 100 个场景"，而是规则本身在同分布数据上稳定。
-复现命令：
-
-```powershell
-python -m labscribe dataset --seed 90909090 --count 100 --out data/eval/heldout.jsonl
-python -m labscribe eval --dataset data/eval/heldout.jsonl --no-report
-```
 
 ### 9.7 必须说清楚的三点（否则 100% 会被误读）
 
@@ -983,13 +697,8 @@ python -m labscribe eval --dataset data/eval/heldout.jsonl --no-report
 
 **第二，存在域泄漏（domain leakage）。**
 离线检测器用颜色标记、OCR 用同一套字体模板渲染——**生成画面的代码和识别画面的代码共享假设**。
-这正是 100% 这么漂亮的原因，也说明它**无法代表真实摄像头精度**。生产环境必须：
-
-```powershell
-python -m pip install -r requirements-vision.txt   # YOLO11 + ByteTrack + PaddleOCR
-python -m labscribe eval                            # 在真实标注上重跑
-```
-
+这正是 100% 这么漂亮的原因，也说明它**无法代表真实摄像头精度**。生产环境要装
+`requirements-vision.txt`（YOLO11 + ByteTrack + PaddleOCR），再在真实标注上重跑 `labscribe eval`。
 报告里记录了当时用的后端（`system.detector/tracker/ocr`），一眼能看出是离线还是生产。
 
 **第三，Agent 完全没有被这套评测覆盖。**

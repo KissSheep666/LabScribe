@@ -370,37 +370,7 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 </code></pre></div>
 
 <p>关键点：<strong>视觉线程和 Agent 线程解耦</strong>。LLM 一次要 2–4 秒，画面不能停；所以视觉侧只管往队列里丢事件，Agent 侧慢慢处理。Demo 里 140 帧只处理了约 1.4 秒（不含 LLM），8 个事件全部正确入队。</p>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/runtime.py（节选）</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">_vision_loop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">,</span> <span class="n">pipeline</span><span class="p">:</span> <span class="n">VisionPipeline</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="o">...</span>
-    <span class="k">for</span> <span class="n">frame</span> <span class="ow">in</span> <span class="n">source</span><span class="o">.</span><span class="n">iter_frames</span><span class="p">():</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop</span><span class="o">.</span><span class="n">is_set</span><span class="p">():</span>
-            <span class="k">break</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">frame_store</span><span class="o">.</span><span class="n">keep</span><span class="p">(</span><span class="n">frame</span><span class="p">)</span>                     <span class="c1"># 环形缓冲，供追溯</span>
-        <span class="n">observations</span> <span class="o">=</span> <span class="n">pipeline</span><span class="o">.</span><span class="n">process</span><span class="p">(</span><span class="n">frame</span><span class="p">)</span>           <span class="c1"># ① 视觉</span>
-        <span class="k">for</span> <span class="n">event</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="o">.</span><span class="n">handle_observations</span><span class="p">(</span><span class="n">observations</span><span class="p">):</span>  <span class="c1"># ② 事件</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">agent_queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>                  <span class="c1"># 传送带：不阻塞</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">events_emitted</span> <span class="o">+=</span> <span class="mi">1</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">bus</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="s2">"observation_event"</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">to_dict</span><span class="p">())</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">frames_processed</span> <span class="o">+=</span> <span class="mi">1</span>
-    <span class="o">...</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">agent_queue</span><span class="o">.</span><span class="n">put_nowait</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>                    <span class="c1"># 收尾信号</span>
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_agent_loop</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="n">item</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">agent_queue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="mf">0.25</span><span class="p">)</span>    <span class="c1"># ③ Agent 慢慢消费</span>
-        <span class="k">except</span> <span class="n">queue</span><span class="o">.</span><span class="n">Empty</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_vision_done</span><span class="o">.</span><span class="n">is_set</span><span class="p">()</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop</span><span class="o">.</span><span class="n">is_set</span><span class="p">():</span>
-                <span class="k">break</span>
-            <span class="k">continue</span>
-        <span class="k">if</span> <span class="n">item</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="o">...</span>
-            <span class="k">break</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">agent</span><span class="o">.</span><span class="n">handle_event</span><span class="p">(</span><span class="n">item</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">bus</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="s2">"agent"</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">to_dict</span><span class="p">())</span>
-</code></pre></div>
-
+<p>两条循环的骨架只有三行：视觉线程 <code>agent_queue.put(event)</code>，Agent 线程 <code>agent_queue.get()</code>，结束时放一个 <code>None</code> 作为收尾信号。</p>
 <hr />
 <h2 id="3-第-1-层视觉层-从像素到可信读数">3. 第 1 层：视觉层 —— 从像素到"可信读数"</h2>
 <h3 id="31-为什么不能每帧都信">3.1 为什么不能每帧都信</h3>
@@ -415,21 +385,7 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 </ol>
 <p>所以视觉层做四件事：检测 → 跟踪 → 节流 OCR → 稳定化。</p>
 <h3 id="32-检测与跟踪谁在看哪台仪器">3.2 检测与跟踪：谁在看哪台仪器</h3>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/vision/pipeline.py</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">process</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">frame</span><span class="p">:</span> <span class="n">Frame</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Observation</span><span class="p">]:</span>
-    <span class="n">raw</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">detector</span><span class="o">.</span><span class="n">detect</span><span class="p">(</span><span class="n">frame</span><span class="p">)</span>
-    <span class="n">detections</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tracker</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
-        <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">raw</span> <span class="k">if</span> <span class="n">d</span><span class="o">.</span><span class="n">confidence</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_detection</span><span class="p">]</span>
-    <span class="p">)</span>
-    <span class="n">actors</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">detections</span> <span class="k">if</span> <span class="n">d</span><span class="o">.</span><span class="n">label</span> <span class="o">==</span> <span class="s2">"actor"</span><span class="p">]</span>
-    <span class="n">instruments</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">detections</span> <span class="k">if</span> <span class="n">d</span><span class="o">.</span><span class="n">label</span> <span class="o">==</span> <span class="s2">"instrument"</span><span class="p">]</span>
-    <span class="n">observations</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Observation</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="k">for</span> <span class="n">inst</span> <span class="ow">in</span> <span class="n">instruments</span><span class="p">:</span>
-        <span class="n">observations</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_observe</span><span class="p">(</span><span class="n">frame</span><span class="p">,</span> <span class="n">inst</span><span class="p">,</span> <span class="n">actors</span><span class="p">))</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">last_observations</span> <span class="o">=</span> <span class="n">observations</span>
-    <span class="k">return</span> <span class="n">observations</span>
-</code></pre></div>
-
+<p>视觉层的主循环只有三步：<code>detector.detect(frame)</code> 拿到检测框 → <code>tracker.update(...)</code> 给每个目标贴上稳定 ID → 按角色分成 <code>actor</code> 人和 <code>instrument</code> 仪器，逐个生成观测。</p>
 <ul>
 <li><code>Detector</code>：生产环境是 YOLO11，离线是 <code>MarkerDetector</code>（颜色标记）。角色只有两种：<code>actor</code>（人/手）和 <code>instrument</code>（仪器）。分类映射在 <code>vision.class_map</code>。</li>
 <li><code>Tracker</code>：生产环境 ByteTrack，离线是 IoU 跟踪器。它保证同一台仪器在连续帧里拿到<strong>稳定的 track_id</strong>，不会一会 <code>instrument-1</code> 一会 <code>instrument-2</code>。</li>
@@ -439,73 +395,45 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 <p><strong>类比：跟踪就像给每个"演员"贴胸牌。</strong> 帧与帧之间演员会移动，但胸牌号不变，这样"读数变化"才能归到同一个对象名下。</p>
 </blockquote>
 <h3 id="33-显示区裁剪-ocr-节流-遮挡">3.3 显示区裁剪 + OCR 节流 + 遮挡</h3>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/vision/pipeline.py（_observe 节选）</span>
-<span class="n">display_roi</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_display_roi</span><span class="p">(</span><span class="n">inst</span><span class="p">)</span>
-<span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_state</span><span class="p">(</span><span class="n">object_id</span><span class="p">)</span>
-
-<span class="n">closest_actor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_closest_actor</span><span class="p">(</span><span class="n">inst</span><span class="p">,</span> <span class="n">actors</span><span class="p">)</span>
-<span class="n">actor_present</span> <span class="o">=</span> <span class="n">closest_actor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-
-<span class="n">occluded</span> <span class="o">=</span> <span class="kc">False</span>
-<span class="k">if</span> <span class="n">closest_actor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="n">occluded</span> <span class="o">=</span> <span class="n">closest_actor</span><span class="o">.</span><span class="n">bbox</span><span class="o">.</span><span class="n">coverage</span><span class="p">(</span><span class="n">display_roi</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">occlusion_ratio</span>
-
-<span class="n">due_ocr</span> <span class="o">=</span> <span class="p">(</span>
-    <span class="ow">not</span> <span class="n">occluded</span>
-    <span class="ow">and</span> <span class="n">frame</span><span class="o">.</span><span class="n">index</span> <span class="o">-</span> <span class="n">state</span><span class="o">.</span><span class="n">last_ocr_frame</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ocr_every_n</span>
-    <span class="ow">and</span> <span class="n">frame</span><span class="o">.</span><span class="n">ts</span> <span class="o">-</span> <span class="n">state</span><span class="o">.</span><span class="n">last_ocr_ts</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ocr_min_interval</span>
-<span class="p">)</span>
-<span class="k">if</span> <span class="n">due_ocr</span><span class="p">:</span>
-    <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ocr</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">frame</span><span class="o">.</span><span class="n">image</span><span class="p">,</span> <span class="n">display_roi</span><span class="p">)</span>
-    <span class="o">...</span>
-<span class="k">elif</span> <span class="n">occluded</span><span class="p">:</span>
-    <span class="n">stable</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">stabilizer</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">frame</span><span class="o">.</span><span class="n">ts</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span>   <span class="c1"># 遮挡=没看到，不是读数 0</span>
-    <span class="n">state</span><span class="o">.</span><span class="n">stable_now</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="n">state</span><span class="o">.</span><span class="n">stable_value</span> <span class="o">=</span> <span class="kc">None</span>
-</code></pre></div>
-
-<p>三个设计点：</p>
+<p>每个观测做四件事，顺序很重要：<strong>先判遮挡 → 再决定要不要 OCR → 只裁显示区 → 节流</strong>。</p>
 <ol>
 <li><strong>只裁显示区</strong>：整帧 OCR 又慢又容易读到标签文字（TITRATOR）。显示区按仪器框的固定比例裁剪（<code>vision.display_roi = [0.20, 0.52, 0.80, 0.86]</code>）。</li>
 <li><strong>按帧节流</strong>：<code>ocr_every_n_frames=3</code>，10 fps 下每 0.3 秒读一次。OCR 是整条视觉链路最贵的一步。</li>
 <li><strong>遮挡 ≠ 0</strong>：手挡住时传 <code>None</code>，而不是 <code>0.0</code>。这很重要——如果传 0，状态机会认为"读数变成 0 了"，写出一条假记录。传 <code>None</code> 表示"这一帧没有可信观测"。</li>
+<li><strong>遮挡判定</strong>：人框覆盖显示区 ≥ 30% 就不读，不做"猜一个"。</li>
 </ol>
 <blockquote>
 <p><strong>类比：实习生被手挡住时会说"没看清"，而不是"我看到 0"。</strong></p>
 </blockquote>
 <h3 id="34-读数稳定器本项目最巧的一小段代码">3.4 读数稳定器（本项目最巧的一小段代码）</h3>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/vision/stability.py</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ts</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">confidence</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StableReading</span><span class="p">:</span>
+<p>这是全项目最值得看的一段代码，因为它决定了"什么才算一个可信的事实"。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/vision/stability.py（核心逻辑，已省略 dataclass 样板）</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ts</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">confidence</span><span class="o">=</span><span class="mf">1.0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StableReading</span><span class="p">:</span>
+    <span class="c1"># 1. 断档太久：旧基线作废</span>
     <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_ts</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ts</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_ts</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_gap_s</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="o">...</span>
     <span class="bp">self</span><span class="o">.</span><span class="n">_last_ts</span> <span class="o">=</span> <span class="n">ts</span>
 
+    <span class="c1"># 2. 空帧/遮挡：保留旧值，但标记"不新鲜"</span>
     <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">confidence</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="n">value</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">changed</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">changed</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
-    <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="nb">float</span><span class="p">(</span><span class="n">ts</span><span class="p">),</span> <span class="nb">float</span><span class="p">(</span><span class="n">value</span><span class="p">),</span> <span class="nb">float</span><span class="p">(</span><span class="n">confidence</span><span class="p">)))</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span> <span class="k">if</span> <span class="n">s</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">ts</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_gap_s</span><span class="p">]</span>
-
+    <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">ts</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">confidence</span><span class="p">))</span>
     <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_samples</span><span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">stable_samples</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
-    <span class="n">window</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">stable_samples</span> <span class="p">:]</span>
-    <span class="n">values</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">window</span><span class="p">]</span>
+    <span class="c1"># 3. 最近 N 个样本是否一致（相对容差，随量程放大）</span>
+    <span class="n">values</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_samples</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">stable_samples</span><span class="p">:]]</span>
     <span class="n">mean</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">values</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">values</span><span class="p">)</span>
-    <span class="n">spread</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">values</span><span class="p">)</span> <span class="o">-</span> <span class="nb">min</span><span class="p">(</span><span class="n">values</span><span class="p">)</span>
     <span class="n">tolerance</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tolerance_abs</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">tolerance_rel</span> <span class="o">*</span> <span class="nb">abs</span><span class="p">(</span><span class="n">mean</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">spread</span> <span class="o">&gt;</span> <span class="n">tolerance</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>     <span class="c1"># 还在跳，不认</span>
+    <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">values</span><span class="p">)</span> <span class="o">-</span> <span class="nb">min</span><span class="p">(</span><span class="n">values</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">tolerance</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>      <span class="c1"># 还在跳，不认</span>
 
-    <span class="n">stable_value</span> <span class="o">=</span> <span class="n">values</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
-    <span class="n">changed</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">abs</span><span class="p">(</span><span class="n">stable_value</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">tolerance</span><span class="p">:</span>
-        <span class="n">changed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>      <span class="c1"># 第一次稳定不算"变化"</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span> <span class="o">=</span> <span class="n">stable_value</span>
-        <span class="o">...</span>
-    <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="n">value</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">changed</span><span class="o">=</span><span class="n">changed</span><span class="p">)</span>
+    <span class="c1"># 4. 与上次稳定值比较，跃变只报一次</span>
+    <span class="n">changed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">abs</span><span class="p">(</span><span class="n">values</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">tolerance</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span> <span class="o">=</span> <span class="n">values</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">StableReading</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_stable</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">changed</span><span class="o">=</span><span class="n">changed</span><span class="p">)</span>
 </code></pre></div>
 
 <p>逐条翻译：</p>
@@ -568,40 +496,9 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 <p><strong>类比：看监控回放。</strong> 你要的不是"第 1 帧有人、第 2 帧有人、……第 140 帧没人"，而是"<strong>他 1.4 秒开始用滴定仪，4.8 秒读数变了，6.7 秒走了</strong>"。</p>
 </blockquote>
 <p>状态机就是那个"剪辑师"。它每个观测只做很少的判断，但因为有<strong>记忆</strong>（<code>_ObjectState</code>），所以能识别出"一段连续行为"。</p>
-<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">_ObjectState</span><span class="p">:</span>
-    <span class="n">phase</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"idle"</span>                   <span class="c1"># idle / active</span>
-    <span class="n">session_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>         <span class="c1"># 当前会话</span>
-    <span class="n">interact_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>              <span class="c1"># 连续"有人在操作"的帧数</span>
-    <span class="n">last_interact_ts</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span> <span class="c1"># 最后一次看到人的时间</span>
-    <span class="n">last_reading</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>     <span class="c1"># 上一次稳定读数</span>
-    <span class="n">last_anomaly_reading</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-</code></pre></div>
-
+<p>这份记忆只有六个字段，值得记住：<code>phase</code>（idle/active）、<code>session_id</code>、<code>interact_frames</code>（连续看见人的帧数）、<code>last_interact_ts</code>（最后一次看到人的时间）、<code>last_reading</code>（上一次稳定读数）、<code>last_anomaly_reading</code>（上次告警的超限值，用来去重）。</p>
 <h3 id="42-会话开始连续-n-帧才算">4.2 会话开始：连续 N 帧才算</h3>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/events/state_machine.py</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">_session_transitions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obs</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">out</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">obs</span><span class="o">.</span><span class="n">action</span> <span class="o">==</span> <span class="s2">"interacting"</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">phase</span> <span class="o">==</span> <span class="s2">"idle"</span><span class="p">:</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">interact_frames</span> <span class="o">+=</span> <span class="mi">1</span>
-            <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">interact_frames</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">start_frames</span><span class="p">:</span>
-                <span class="n">state</span><span class="o">.</span><span class="n">phase</span> <span class="o">=</span> <span class="s2">"active"</span>
-                <span class="n">state</span><span class="o">.</span><span class="n">session_id</span> <span class="o">=</span> <span class="n">new_id</span><span class="p">(</span><span class="s2">"sess"</span><span class="p">)</span>
-                <span class="n">state</span><span class="o">.</span><span class="n">last_interact_ts</span> <span class="o">=</span> <span class="n">obs</span><span class="o">.</span><span class="n">ts</span>
-                <span class="o">...</span>
-                <span class="n">out</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="p">(</span><span class="s2">"session_start"</span><span class="p">,</span> <span class="n">obs</span><span class="p">,</span> <span class="n">obs</span><span class="o">.</span><span class="n">confidence</span><span class="p">,</span> <span class="o">...</span><span class="p">))</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">interact_frames</span> <span class="o">=</span> <span class="mi">0</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">last_interact_ts</span> <span class="o">=</span> <span class="n">obs</span><span class="o">.</span><span class="n">ts</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">state</span><span class="o">.</span><span class="n">interact_frames</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="k">if</span> <span class="p">(</span><span class="n">state</span><span class="o">.</span><span class="n">phase</span> <span class="o">==</span> <span class="s2">"active"</span>
-                <span class="ow">and</span> <span class="n">obs</span><span class="o">.</span><span class="n">ts</span> <span class="o">-</span> <span class="n">state</span><span class="o">.</span><span class="n">last_interact_ts</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">end_idle_s</span><span class="p">):</span>
-            <span class="n">out</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="p">(</span><span class="s2">"session_end"</span><span class="p">,</span> <span class="n">obs</span><span class="p">,</span> <span class="n">obs</span><span class="o">.</span><span class="n">confidence</span><span class="p">,</span> <span class="o">...</span><span class="p">))</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">phase</span> <span class="o">=</span> <span class="s2">"idle"</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">session_id</span> <span class="o">=</span> <span class="kc">None</span>
-</code></pre></div>
-
+<p>规则：<code>idle</code> 状态下，连续 <code>session_start_frames=3</code> 帧检测到人在操作，才切到 <code>active</code> 并发 <code>session_start</code>；<code>interacting</code> 期间不断刷新 <code>last_interact_ts</code>；一旦超过 <code>session_end_idle_s=1.2</code> 秒没有交互，发 <code>session_end</code> 并回到 <code>idle</code>。</p>
 <ul>
 <li><code>session_start_frames=3</code>：路过镜头、误检、单帧闪烁都不会触发"开始实验"。</li>
 <li><code>session_end_idle_s=1.2</code>：人离开 1.2 秒才判定结束。短暂转身拿东西不算结束。</li>
@@ -610,18 +507,7 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 <p><strong>类比：电梯关门键。</strong> 按一下不动，连按三下才关门——防误触。</p>
 </blockquote>
 <h3 id="43-读数变更带上一次值的证据">4.3 读数变更：带"上一次值"的证据</h3>
-<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading_stable</span> <span class="ow">and</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">last_reading</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">state</span><span class="o">.</span><span class="n">last_reading</span> <span class="o">=</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span>          <span class="c1"># 建立基线，不发事件</span>
-    <span class="k">elif</span> <span class="nb">abs</span><span class="p">(</span><span class="n">obs</span><span class="o">.</span><span class="n">reading</span> <span class="o">-</span> <span class="n">state</span><span class="o">.</span><span class="n">last_reading</span><span class="p">)</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">reading_tol</span><span class="p">:</span>
-        <span class="n">event</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="p">(</span>
-            <span class="s2">"reading_change"</span><span class="p">,</span> <span class="n">obs</span><span class="p">,</span> <span class="n">effective</span><span class="p">,</span> <span class="n">reading</span><span class="o">=</span><span class="n">obs</span><span class="o">.</span><span class="n">reading</span><span class="p">,</span>
-            <span class="n">meta</span><span class="o">=</span><span class="p">{</span><span class="s2">"previous_reading"</span><span class="p">:</span> <span class="n">state</span><span class="o">.</span><span class="n">last_reading</span><span class="p">,</span> <span class="o">...</span><span class="p">},</span>
-        <span class="p">)</span>
-        <span class="n">out</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
-        <span class="n">state</span><span class="o">.</span><span class="n">last_reading</span> <span class="o">=</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span>
-</code></pre></div>
-
+<p>规则：稳定读数与 <code>last_reading</code> 相差超过 <code>reading_tol</code> 时才发事件，并把旧值写进 <code>meta.previous_reading</code>；第一次拿到稳定读数只建立基线，不发事件。</p>
 <p>注意事件里带了 <code>previous_reading</code>。这不是装饰——Agent 写记录时可以直接引用"3.5 → 7.2"，人工复核也一眼能看出改了哪一栏。</p>
 <h3 id="44-异常独立于变更的第二道闸">4.4 异常：独立于"变更"的第二道闸</h3>
 <p>读数既会触发 <code>reading_change</code>（因为变了），也会触发 <code>anomaly</code>（因为超限）。两者<strong>故意分开</strong>：</p>
@@ -629,68 +515,20 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 <li><code>reading_change</code> 是"发生了什么"；</li>
 <li><code>anomaly</code> 是"这件事是否违规"。</li>
 </ul>
-<div class="codehilite"><pre><span></span><code><span class="n">limits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">obs</span><span class="o">.</span><span class="n">object_id</span><span class="p">)</span>         <span class="c1"># 例如 instrument-1: [0, 14]</span>
-<span class="k">if</span> <span class="n">limits</span> <span class="ow">and</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">effective</span> <span class="o">&gt;=</span> <span class="mf">0.3</span><span class="p">:</span>
-    <span class="n">low</span><span class="p">,</span> <span class="n">high</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">limits</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"min"</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)),</span> <span class="nb">float</span><span class="p">(</span><span class="n">limits</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"max"</span><span class="p">,</span> <span class="mf">1e9</span><span class="p">))</span>
-    <span class="k">if</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span> <span class="o">&lt;</span> <span class="n">low</span> <span class="ow">or</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span> <span class="o">&gt;</span> <span class="n">high</span><span class="p">:</span>
-        <span class="n">already_flagged</span> <span class="o">=</span> <span class="p">(</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">last_anomaly_reading</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-            <span class="ow">and</span> <span class="nb">abs</span><span class="p">(</span><span class="n">obs</span><span class="o">.</span><span class="n">reading</span> <span class="o">-</span> <span class="n">state</span><span class="o">.</span><span class="n">last_anomaly_reading</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">reading_tol</span>
-        <span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">already_flagged</span><span class="p">:</span>
-            <span class="o">...</span>
-            <span class="n">out</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="p">(</span><span class="s2">"anomaly"</span><span class="p">,</span> <span class="n">obs</span><span class="p">,</span> <span class="n">effective</span><span class="p">,</span> <span class="n">reading</span><span class="o">=</span><span class="n">obs</span><span class="o">.</span><span class="n">reading</span><span class="p">,</span> <span class="n">meta</span><span class="o">=</span><span class="n">meta</span><span class="p">))</span>
-            <span class="n">state</span><span class="o">.</span><span class="n">last_anomaly_reading</span> <span class="o">=</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading</span>
-</code></pre></div>
-
-<p><code>already_flagged</code> 保证同一个超限值不会每帧告警一次。</p>
+<p>规则：读数超出 <code>events.limits</code> 的 <code>[min, max]</code> 时发 <code>anomaly</code>；用 <code>last_anomaly_reading</code> 记住上一次告警的值，同一个超限值不会每帧告警一次；读数回到范围内再清除该记录。</p>
 <h3 id="45-置信度取最小值容易忽略的细节">4.5 置信度取"最小值"（容易忽略的细节）</h3>
-<div class="codehilite"><pre><span></span><code><span class="n">reading_conf</span> <span class="o">=</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading_confidence</span> <span class="k">if</span> <span class="n">obs</span><span class="o">.</span><span class="n">reading_confidence</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mf">1.0</span>
-<span class="n">effective</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">detection_conf</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="n">reading_conf</span><span class="p">))</span>
-
-<span class="k">if</span> <span class="n">detection_conf</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_conf</span><span class="p">:</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_session_transitions</span><span class="p">(</span><span class="n">obs</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span>
-<span class="k">else</span><span class="p">:</span>
-    <span class="o">...</span>  <span class="c1"># 只累积候选，不改状态</span>
-</code></pre></div>
-
 <p>一次观测有两份置信度：</p>
 <ul>
 <li>检测置信度：<strong>仪器</strong>认得准不准；</li>
 <li>OCR 置信度：<strong>读数</strong>读得准不准。</li>
 </ul>
-<p>取 <code>min</code> 意味着：<strong>仪器检测很准但数字读糊了，也不能算可信。</strong></p>
+<p>两者取 <code>min</code> 作为有效置信度。意味着：<strong>仪器检测很准但数字读糊了，也不能算可信。</strong></p>
 <blockquote>
 <p><strong>类比：双人签字。</strong> 会计和出纳都签字才能付款；任何一个人说"我看不清"，这笔账就挂起。</p>
 </blockquote>
 <h3 id="46-低置信度-待确认队列">4.6 低置信度 → 待确认队列</h3>
-<div class="codehilite"><pre><span></span><code><span class="c1"># 低置信度不会改变状态，只累积"候选"</span>
-<span class="k">if</span> <span class="n">detection_conf</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_conf</span><span class="p">:</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_session_transitions</span><span class="p">(</span><span class="n">obs</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span>
-<span class="k">else</span><span class="p">:</span>
-    <span class="k">if</span> <span class="n">obs</span><span class="o">.</span><span class="n">action</span> <span class="o">==</span> <span class="s2">"interacting"</span> <span class="ow">and</span> <span class="n">state</span><span class="o">.</span><span class="n">phase</span> <span class="o">==</span> <span class="s2">"idle"</span><span class="p">:</span>
-        <span class="n">state</span><span class="o">.</span><span class="n">interact_frames</span> <span class="o">+=</span> <span class="mi">1</span>          <span class="c1"># 证据仍要累积</span>
-    <span class="o">...</span>
-    <span class="n">candidate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_session_candidate</span><span class="p">(</span><span class="n">obs</span><span class="p">,</span> <span class="n">state</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">candidate</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">out</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">candidate</span><span class="p">)</span>
-</code></pre></div>
-
+<p>门禁规则很简单：<strong>置信度低于 <code>events.min_confidence</code> 时，不改状态机状态，只把候选写入 <code>pending</code> 表。</strong></p>
 <p>为什么"不改状态、只累积证据"？因为置信度低时仍然可能有 3 帧连续的弱信号。如果直接丢弃，第二天的模糊场景就会漏记。现在它会被放进 <code>pending</code> 表，Dashboard 上人工点一下"确认"，就会生成一个 <code>human_confirmed</code> 事件，并<strong>继续交给 Agent 写记录</strong>。</p>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/events/processor.py</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">confirm_pending</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pending_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="n">item</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">get_pending</span><span class="p">(</span><span class="n">pending_id</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">item</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">item</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"status"</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"open"</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">None</span>
-    <span class="n">event</span> <span class="o">=</span> <span class="n">LabEvent</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s2">"draft_event"</span><span class="p">])</span>
-    <span class="n">event</span><span class="o">.</span><span class="n">event_id</span> <span class="o">=</span> <span class="n">new_event_id</span><span class="p">()</span>
-    <span class="n">event</span><span class="o">.</span><span class="n">status</span> <span class="o">=</span> <span class="s2">"human_confirmed"</span>
-    <span class="n">event</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">"confirmed_from_pending"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">record_event</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">resolve_pending</span><span class="p">(</span><span class="n">pending_id</span><span class="p">,</span> <span class="s2">"confirmed"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="p">{</span><span class="s2">"pending_id"</span><span class="p">:</span> <span class="n">pending_id</span><span class="p">,</span> <span class="s2">"status"</span><span class="p">:</span> <span class="s2">"confirmed"</span><span class="p">,</span> <span class="s2">"event"</span><span class="p">:</span> <span class="n">event</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()}</span>
-</code></pre></div>
-
 <blockquote>
 <p><strong>类比：收银台的"待核筐"。</strong> 扫不清的商品先放一边，不影响后面结账；人工确认后补扫，账照样完整。</p>
 </blockquote>
@@ -739,17 +577,9 @@ t=13.30s  session_end    reading=15.2   conf=0.99  frame=demo-00133
 </tbody>
 </table>
 <p>如果同步处理，摄像头会卡成幻灯片。解耦后，视觉侧 140 帧 1.4 秒跑完，Agent 侧按自己的节奏消化 8 个事件。</p>
-<p>线程安全收尾也做了：</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">stop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">5.0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_stop</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">agent_queue</span><span class="o">.</span><span class="n">put_nowait</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
-    <span class="k">for</span> <span class="n">thread</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_vision_thread</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_agent_thread</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">thread</span> <span class="ow">and</span> <span class="n">thread</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
-            <span class="n">thread</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
-    <span class="o">...</span>
-</code></pre></div>
-
-<p>每次 <code>start()</code> 重建 <code>RuleStateMachine</code> 和 <code>EventProcessor</code>，避免上一次运行的会话状态串到下一次（有专门测试 <code>test_runtime_can_rerun_a_scenario_without_state_bleed</code>）。</p>
+<p>收尾也很直接：<code>stop()</code> 先置停止标志，往队列塞一个 <code>None</code> 唤醒 Agent 线程，再带超时 join 两条线程。
+另外每次 <code>start()</code> 都会重建 <code>RuleStateMachine</code> 和 <code>EventProcessor</code>，避免上一次运行的会话状态串到下一次
+（有专门测试 <code>test_runtime_can_rerun_a_scenario_without_state_bleed</code>）。</p>
 <hr />
 <h2 id="6-第-4-层agent-llm-只做决策不做感知">6. 第 4 层：Agent —— LLM 只做决策，不做感知</h2>
 <h3 id="61-为什么不让-llm-直接看视频">6.1 为什么不让 LLM 直接看视频</h3>
@@ -878,100 +708,26 @@ Planner guidance (deterministic, derived from the SOP):
 </tr>
 </tbody>
 </table>
-<p><strong>最重要的门禁：<code>write_experiment_record</code> 不允许模型提供帧号。</strong></p>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/agent/tools.py</span>
-<span class="n">event_id</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">args</span><span class="p">[</span><span class="s2">"event_id"</span><span class="p">])</span>
-<span class="n">event</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">get_event</span><span class="p">(</span><span class="n">event_id</span><span class="p">)</span>
-<span class="k">if</span> <span class="n">event</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="k">return</span> <span class="p">{</span><span class="s2">"ok"</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"event_id not found: </span><span class="si">{</span><span class="n">event_id</span><span class="si">}</span><span class="s2">"</span><span class="p">}</span>
-<span class="o">...</span>
-<span class="n">record</span> <span class="o">=</span> <span class="n">ExperimentRecord</span><span class="p">(</span>
-    <span class="n">record_id</span><span class="o">=</span><span class="n">new_id</span><span class="p">(</span><span class="s2">"rec"</span><span class="p">),</span>
-    <span class="n">experiment_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">args</span><span class="p">[</span><span class="s2">"experiment_id"</span><span class="p">]),</span>
-    <span class="n">session_id</span><span class="o">=</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"session_id"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">session_id</span><span class="p">()</span> <span class="ow">or</span> <span class="s2">"adhoc"</span><span class="p">,</span>
-    <span class="n">step_id</span><span class="o">=</span><span class="n">step_id</span><span class="p">,</span>
-    <span class="n">event_id</span><span class="o">=</span><span class="n">event_id</span><span class="p">,</span>
-    <span class="n">source_frame</span><span class="o">=</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"source_frame"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">,</span>     <span class="c1"># ← 从数据库反查，不信模型</span>
-    <span class="n">object_id</span><span class="o">=</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"object_id"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">,</span>
-    <span class="n">reading</span><span class="o">=</span><span class="n">event</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"reading"</span><span class="p">),</span>                      <span class="c1"># ← 同样反查</span>
-    <span class="o">...</span>
-<span class="p">)</span>
-<span class="n">dedupe_key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">event_id</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">step_id</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="s1">'-'</span><span class="si">}</span><span class="s2">"</span>
-<span class="n">saved</span><span class="p">,</span> <span class="n">created</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">save_record</span><span class="p">(</span><span class="n">record</span><span class="p">,</span> <span class="n">dedupe_key</span><span class="p">)</span>
-<span class="k">return</span> <span class="p">{</span>
-    <span class="s2">"ok"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
-    <span class="s2">"created"</span><span class="p">:</span> <span class="n">created</span><span class="p">,</span>
-    <span class="s2">"deduped"</span><span class="p">:</span> <span class="ow">not</span> <span class="n">created</span><span class="p">,</span>
-    <span class="s2">"record_id"</span><span class="p">:</span> <span class="n">saved</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"record_id"</span><span class="p">),</span>
-    <span class="s2">"source_frame"</span><span class="p">:</span> <span class="n">saved</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"source_frame"</span><span class="p">),</span>
-    <span class="s2">"frame_url"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"/api/frames/</span><span class="si">{</span><span class="n">saved</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'source_frame'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">saved</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"source_frame"</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="o">...</span>
-<span class="p">}</span>
-</code></pre></div>
-
-<p>这消灭了整类问题：<strong>模型幻觉出一条"读数 99，帧 abc.jpg"的记录是不可能的</strong>——工具会拿 <code>event_id</code> 去库里查，查不到就报错；查到了就用事件里的真实读数与真实帧。</p>
+<p><strong>最重要的门禁：<code>write_experiment_record</code> 不允许模型提供帧号和读数。</strong></p>
+<p>模型只能给一个 <code>event_id</code>。工具拿它去库里查事件，查不到直接报错；查到了就<strong>用事件里的真实字段</strong>填记录
+（<code>source_frame</code>、<code>reading</code>、<code>object_id</code> 全部反查），并用 <code>event_id|step_id</code> 作为幂等键。</p>
+<p>这段逻辑只有几行，但消灭了整类问题：<strong>模型幻觉出一条"读数 99，帧 abc.jpg"的记录是不可能的</strong>。</p>
 <blockquote>
 <p><strong>类比：报销单系统。</strong> 你只要填"行程编号"，金额和发票照片由系统从订单里自动带出，不给你手填的机会。</p>
 </blockquote>
 <p><strong>幂等</strong>：<code>dedupe_key = event_id|step_id</code> 是 SQLite 唯一索引。同一事件同一步骤重复写，返回 <code>deduped=true</code> 和原记录，不会产生两行台账。</p>
 <h3 id="65-llm-循环">6.5 LLM 循环</h3>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/agent/loop.py（节选）</span>
-<span class="n">messages</span> <span class="o">=</span> <span class="p">[</span>
-    <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_system_prompt</span><span class="p">()},</span>
-    <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"Event:</span><span class="se">\n</span><span class="si">{</span><span class="o">...</span><span class="si">}</span><span class="se">\n\n</span><span class="s2">Session context:</span><span class="se">\n</span><span class="si">{</span><span class="o">...</span><span class="si">}</span><span class="se">\n\n</span><span class="s2">"</span>
-                                <span class="sa">f</span><span class="s2">"Planner guidance (deterministic, derived from the SOP):</span><span class="se">\n</span><span class="si">{</span><span class="o">...</span><span class="si">}</span><span class="s2">"</span><span class="p">},</span>
-<span class="p">]</span>
-<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_steps</span><span class="p">):</span>                      <span class="c1"># 默认 8 步，防死循环</span>
-    <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm</span><span class="o">.</span><span class="n">chat</span><span class="p">(</span><span class="n">messages</span><span class="p">,</span> <span class="n">tools</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tools</span><span class="o">.</span><span class="n">schemas</span><span class="p">())</span>
-    <span class="n">logger</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="s2">"assistant"</span><span class="p">,</span> <span class="n">content</span><span class="o">=</span><span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">latency_ms</span><span class="o">=</span><span class="n">response</span><span class="o">.</span><span class="n">latency_ms</span><span class="p">,</span>
-               <span class="n">result</span><span class="o">=</span><span class="p">{</span><span class="s2">"tool_calls"</span><span class="p">:</span> <span class="p">[</span><span class="n">tc</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">tc</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">tool_calls</span><span class="p">]})</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">response</span><span class="o">.</span><span class="n">tool_calls</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">AgentResult</span><span class="p">(</span><span class="n">run_id</span><span class="p">,</span> <span class="s2">"completed"</span><span class="p">,</span> <span class="s2">"llm"</span><span class="p">,</span> <span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">event_id</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
-    <span class="n">messages</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"assistant"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">response</span><span class="o">.</span><span class="n">content</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">,</span>
-                     <span class="s2">"tool_calls"</span><span class="p">:</span> <span class="n">response</span><span class="o">.</span><span class="n">raw_tool_calls</span><span class="p">})</span>
-    <span class="k">for</span> <span class="n">call</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">tool_calls</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">call</span><span class="o">.</span><span class="n">error</span><span class="p">:</span>
-            <span class="n">result</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"ok"</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">:</span> <span class="n">call</span><span class="o">.</span><span class="n">error</span><span class="p">}</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="s2">"tool"</span><span class="p">,</span> <span class="n">tool</span><span class="o">=</span><span class="n">call</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">arguments</span><span class="o">=</span><span class="n">call</span><span class="o">.</span><span class="n">arguments</span><span class="p">,</span> <span class="n">result</span><span class="o">=</span><span class="n">result</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">result</span> <span class="o">=</span> <span class="n">logger</span><span class="o">.</span><span class="n">call</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tools</span><span class="p">,</span> <span class="n">call</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">call</span><span class="o">.</span><span class="n">arguments</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
-        <span class="n">messages</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"tool"</span><span class="p">,</span> <span class="s2">"tool_call_id"</span><span class="p">:</span> <span class="n">call</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
-                         <span class="s2">"content"</span><span class="p">:</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="nb">str</span><span class="p">)})</span>
-</code></pre></div>
-
+<p>循环骨架很短：把 system prompt、事件、会话上下文、规划建议组成 messages，最多跑 <code>max_steps=8</code> 轮；每一轮把模型的 tool_calls 逐个执行，把结果以 <code>role="tool"</code> 追加回 messages；模型不再要求调用工具时结束。</p>
 <p>一个事件通常 1–3 轮：第 1 轮并发发出"校验顺序 + 校验读数"；第 2 轮写记录并推进步骤；第 3 轮给结束语。实测单事件 2.0–3.9 秒。</p>
 <h3 id="66-规则回退">6.6 规则回退</h3>
 <blockquote>
 <p><strong>类比：书记员请假，代理书记员照着模板继续写。</strong></p>
 </blockquote>
-<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="p">:</span>
-    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">"llm"</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run_llm</span><span class="p">(</span><span class="n">event</span><span class="p">,</span> <span class="n">run_id</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">logger</span><span class="p">)</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run_rules</span><span class="p">(</span><span class="n">event</span><span class="p">,</span> <span class="n">run_id</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">logger</span><span class="p">)</span>
-<span class="k">except</span> <span class="n">LLMError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
-    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">"llm"</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">fallback_to_rules</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run_rules</span><span class="p">(</span><span class="n">event</span><span class="p">,</span> <span class="n">run_id</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">logger</span><span class="p">)</span>
-        <span class="n">result</span><span class="o">.</span><span class="n">status</span> <span class="o">=</span> <span class="s2">"fallback_rules"</span>
-        <span class="n">result</span><span class="o">.</span><span class="n">summary</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"LLM 不可用，已回退到规则 Agent：</span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span>
-        <span class="n">result</span><span class="o">.</span><span class="n">error</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span>
-</code></pre></div>
-
-<p>触发条件包括：没 key、超时、429/5xx（带 2 次重试后）。运行记录里 <code>status=fallback_rules</code>，能一眼看出这条记录不是 LLM 写的。</p>
+<p>逻辑只有一层 try/except：LLM 模式下抛 <code>LLMError</code>（没 key、超时、429/5xx 重试后仍失败）且允许回退时，改用规则 Agent 跑完，并把状态标成 <code>fallback_rules</code>。运行记录里一眼能看出这条记录不是 LLM 写的。</p>
 <h3 id="67-安全网保证每条事件都有台账">6.7 安全网：保证"每条事件都有台账"</h3>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_ensure_traceability</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">logger</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">record_for_event</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">event_id</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">call</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tools</span><span class="p">,</span> <span class="s2">"write_experiment_record"</span><span class="p">,</span> <span class="p">{</span>
-            <span class="s2">"experiment_id"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">experiment_id</span><span class="p">,</span>
-            <span class="s2">"event_id"</span><span class="p">:</span> <span class="n">event</span><span class="o">.</span><span class="n">event_id</span><span class="p">,</span>
-            <span class="s2">"summary"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"自动补录：</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_rule_summary</span><span class="p">(</span><span class="n">event</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
-            <span class="s2">"note"</span><span class="p">:</span> <span class="s2">"safety net: agent did not write a record"</span><span class="p">,</span>
-        <span class="p">},</span> <span class="n">ctx</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"anomaly"</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">alerts_for_event</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">event_id</span><span class="p">):</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">call</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tools</span><span class="p">,</span> <span class="s2">"raise_alert"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"severity"</span><span class="p">:</span> <span class="s2">"critical"</span><span class="p">,</span> <span class="o">...</span><span class="p">},</span> <span class="n">ctx</span><span class="p">)</span>
-</code></pre></div>
-
-<p>无论 LLM 返回什么、是否报错，<strong>每条事件最终至少有一条记录</strong>；anomaly 最终至少有一条告警。这不是为了"掩盖失败"，而是为了让审计链不断裂——补写会明确标注 <code>safety net</code>。</p>
+<p>Agent 回合结束后无条件检查一次：该事件有没有记录？没有就补一条，summary 前缀写"自动补录："；anomaly 有没有告警？没有就补一条 critical。补写也会写进 <code>agent_steps</code>，明确标注 <code>safety net</code>。</p>
+<p>无论 LLM 返回什么、是否报错，<strong>每条事件最终至少有一条记录</strong>；anomaly 最终至少有一条告警。
+这不是为了"掩盖失败"，而是为了让审计链不断裂。</p>
 <hr />
 <h2 id="7-第-5-层存储与追溯-每本台账钉一张照片">7. 第 5 层：存储与追溯 —— 每本台账钉一张照片</h2>
 <h3 id="71-数据表">7.1 数据表</h3>
@@ -1025,32 +781,9 @@ Planner guidance (deterministic, derived from the SOP):
 <blockquote>
 <p><strong>类比：监控录像不会永远保留，但"事故片段"要永久保留。</strong></p>
 </blockquote>
-<p>7×24 摄像头一天几十万帧，全存会撑爆磁盘。<code>FrameStore</code> 用内存环形缓冲（默认 240 帧）保住最近画面，只有<strong>被事件或待确认项引用</strong>时才写 JPEG：</p>
-<div class="codehilite"><pre><span></span><code><span class="c1"># labscribe/store/frames.py</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">keep</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">frame</span><span class="p">:</span> <span class="n">Frame</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">[</span><span class="n">frame</span><span class="o">.</span><span class="n">frame_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">frame</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">move_to_end</span><span class="p">(</span><span class="n">frame</span><span class="o">.</span><span class="n">frame_id</span><span class="p">)</span>
-    <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">)</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_buffered</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">popitem</span><span class="p">(</span><span class="n">last</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-
-<span class="k">def</span><span class="w"> </span><span class="nf">persist</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">frame_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">frame_id</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">None</span>
-    <span class="n">cached</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_persisted</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">frame_id</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">cached</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">cached</span>
-    <span class="n">frame</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">frame_id</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">frame</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">row</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">get_frame</span><span class="p">(</span><span class="n">frame_id</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">row</span><span class="p">[</span><span class="s2">"path"</span><span class="p">]</span> <span class="k">if</span> <span class="n">row</span> <span class="k">else</span> <span class="kc">None</span>
-    <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">frames_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">frame_id</span><span class="si">}</span><span class="s2">.jpg"</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
-        <span class="n">cv2</span><span class="o">.</span><span class="n">imwrite</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="n">frame</span><span class="o">.</span><span class="n">image</span><span class="p">,</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">cv2</span><span class="o">.</span><span class="n">IMWRITE_JPEG_QUALITY</span><span class="p">),</span> <span class="mi">88</span><span class="p">])</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">db</span><span class="o">.</span><span class="n">save_frame</span><span class="p">(</span><span class="n">frame_id</span><span class="o">=</span><span class="n">frame_id</span><span class="p">,</span> <span class="n">path</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="n">ts</span><span class="o">=</span><span class="n">frame</span><span class="o">.</span><span class="n">ts</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
-    <span class="bp">self</span><span class="o">.</span><span class="n">_persisted</span><span class="p">[</span><span class="n">frame_id</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
-    <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
-</code></pre></div>
-
+<p>7×24 摄像头一天几十万帧，全存会撑爆磁盘。<code>FrameStore</code> 用内存环形缓冲（默认 240 帧）保住最近画面，
+只有<strong>被事件或待确认项引用</strong>时才写 JPEG。所以磁盘上永远只有"被引用过的那些帧"，数量级等于事件数，
+而不是帧数。记录里存的是 <code>frame_id</code>，取图时先查缓冲、再查数据库索引，找不到就是这帧从未被引用。</p>
 <h3 id="73-追溯链一条命令回到原始画面">7.3 追溯链：一条命令回到原始画面</h3>
 <div class="codehilite"><pre><span></span><code>ExperimentRecord.record_id
         │ event_id
@@ -1134,7 +867,7 @@ GET /api/records/{record_id}/trace
 <blockquote>
 <p>这张图就是 <code>data/frames/demo-00098.jpg</code>，也是 <code>/api/records/rec-311db1546459/trace</code> 返回的那一帧。</p>
 </blockquote>
-<h3 id="异常链路同一-demo-的-152">异常链路（同一 Demo 的 15.2）</h3>
+<h3 id="81-异常链路同一-demo-的-152">8.1 异常链路（同一 Demo 的 15.2）</h3>
 <div class="codehilite"><pre><span></span><code>事件:     {"type": "anomaly", "reading": 15.2, "source_frame": "demo-00116"}
 工具:     raise_alert(severity="critical")  +  write_experiment_record(...)
 告警:     异常读数 15.2 超出允许范围 [0.0, 14.0]
@@ -1394,19 +1127,15 @@ SOP:      completed=["S1","S2","S3"], next="S4"   ← 超限，S4 拒绝推进
 </ol>
 <p>小样本时的替代方案：<strong>k 折交叉验证</strong> + 固定随机种子，报告均值与标准差，而不是单次分数。</p>
 <h3 id="95-匹配规则事件是有时间的离散点不能直接算准确率">9.5 匹配规则（事件是"有时间的离散点"，不能直接算准确率）</h3>
-<div class="codehilite"><pre><span></span><code>对每条标注：
-   在同类型、未被使用的预测里，优先找落在 window 内的
-   取时间最接近的那条，一对一匹配
-   窗口外 = 漏检（FN）；没被匹配的预测 = 误报（FP）
-</code></pre></div>
-
+<p>对每条标注，在同类型、未被使用的预测里找落在 <code>window</code> 内的，取时间最接近的一条，一对一匹配。
+窗口外算漏检（FN），没被匹配的预测算误报（FP）。</p>
 <p>为什么不能只看"总分对/总分错"？因为事件有<strong>时间容差</strong>：早 0.3 秒和晚 0.3 秒都是对的；
-而漏掉一个、多报一个，是两个不同的错误。所以用 TP / FP / FN：</p>
-<div class="codehilite"><pre><span></span><code>precision = TP / (TP + FP)     报出来的事件里，有多少是真的
-recall    = TP / (TP + FN)     真事件里，有多少被报出来了
-F1        = 2PR / (P + R)      两者的调和平均
-</code></pre></div>
-
+而漏掉一个、多报一个，是两个不同的错误。所以用 TP / FP / FN 三个量：</p>
+<ul>
+<li><code>precision = TP / (TP + FP)</code>：报出来的事件里，有多少是真的；</li>
+<li><code>recall = TP / (TP + FN)</code>：真事件里，有多少被报出来了；</li>
+<li><code>F1</code>：两者的调和平均。</li>
+</ul>
 <p>延迟 = 预测时刻 − 标注时刻，锚定<strong>物理变化时刻</strong>，所以能真实反映"系统多久才确认"（含稳定化等待）。</p>
 <h3 id="96-结果">9.6 结果</h3>
 <p><strong>开发集</strong>（<code>data/eval/annotations.jsonl</code>，seed 20260101，414 事件）：</p>
@@ -1503,24 +1232,16 @@ F1        = 2PR / (P + R)      两者的调和平均
 </tr>
 </tbody>
 </table>
-<p>两套数字几乎一致，说明结果不是"记住了这 100 个场景"，而是规则本身在同分布数据上稳定。
-复现命令：</p>
-<div class="codehilite"><pre><span></span><code><span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">dataset</span> <span class="p">-</span><span class="n">-seed</span> <span class="n">90909090</span> <span class="p">-</span><span class="n">-count</span> <span class="n">100</span> <span class="p">-</span><span class="n">-out</span> <span class="n">data</span><span class="p">/</span><span class="n">eval</span><span class="p">/</span><span class="n">heldout</span><span class="p">.</span><span class="n">jsonl</span>
-<span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">eval</span> <span class="p">-</span><span class="n">-dataset</span> <span class="n">data</span><span class="p">/</span><span class="n">eval</span><span class="p">/</span><span class="n">heldout</span><span class="p">.</span><span class="n">jsonl</span> <span class="p">-</span><span class="n">-no-report</span>
-</code></pre></div>
-
+<p>两套数字几乎一致，说明结果不是"记住了这 100 个场景"，而是规则本身在同分布数据上稳定。</p>
 <h3 id="97-必须说清楚的三点否则-100-会被误读">9.7 必须说清楚的三点（否则 100% 会被误读）</h3>
 <p><strong>第一，这是"同分布留出"，不是真实泛化。</strong>
 两套数据都由同一个生成器产生，只是随机种子不同。它能排除"调参调到过拟合这 100 个场景"，
 但排除不了"合成世界与真实实验室的差距"。</p>
 <p><strong>第二，存在域泄漏（domain leakage）。</strong>
 离线检测器用颜色标记、OCR 用同一套字体模板渲染——<strong>生成画面的代码和识别画面的代码共享假设</strong>。
-这正是 100% 这么漂亮的原因，也说明它<strong>无法代表真实摄像头精度</strong>。生产环境必须：</p>
-<div class="codehilite"><pre><span></span><code><span class="n">python</span> <span class="n">-m</span> <span class="n">pip</span> <span class="n">install</span> <span class="n">-r</span> <span class="n">requirements-vision</span><span class="p">.</span><span class="n">txt</span>   <span class="c"># YOLO11 + ByteTrack + PaddleOCR</span>
-<span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">eval</span>                            <span class="c"># 在真实标注上重跑</span>
-</code></pre></div>
-
-<p>报告里记录了当时用的后端（<code>system.detector/tracker/ocr</code>），一眼能看出是离线还是生产。</p>
+这正是 100% 这么漂亮的原因，也说明它<strong>无法代表真实摄像头精度</strong>。生产环境要装
+<code>requirements-vision.txt</code>（YOLO11 + ByteTrack + PaddleOCR），再在真实标注上重跑 <code>labscribe eval</code>。
+报告里记录了当时用的后端（<code>system.detector/tracker/ocr</code>），一眼能看出是离线还是生产。</p>
 <p><strong>第三，Agent 完全没有被这套评测覆盖。</strong>
 上面的指标只评"视觉 + 事件层"。LLM 写记录的<strong>正确性</strong>（措辞是否准确、步骤归属是否对、
 有没有幻觉）不在这个基准里。这是一个明确的缺口，补法见第 10 章。</p>
