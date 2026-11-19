@@ -213,7 +213,7 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 <p><strong>阅读说明</strong>：这是一份端到端的原理文档，不需要事先了解 CV 或 LLM。
 第 3–7 节按数据流逐层拆解（代码 + 类比），第 8 节用一个真实事件串起全链路，
 第 9 节讲数据集与评测（含训练集/测试集概念），第 10 节讲生产环境如何获得可信的真实数据，
-第 11 节是常见疑问。每节都可独立阅读，卡住时可以先跳到第 8 节看全景。</p>
+第 11 节是常见疑问，文末附<strong>面试重点</strong>（按「AI Agent 工程实习生」JD 逐条对照）。每节都可独立阅读，卡住时可以先跳到第 8 节看全景。</p>
 <p>常用术语速查（完整版见文末术语表）：</p>
 <table>
 <thead>
@@ -1958,6 +1958,154 @@ pending.status = rejected   →  操作员认为"这里不该有事件"       �
 </tr>
 </tbody>
 </table>
+<hr />
+<h2 id="附二面试重点按-jd-逐条对照">附二：面试重点（按 JD 逐条对照）</h2>
+<blockquote>
+<p>这里的岗位是「AI Agent 工程实习生」，职责是<strong>把视觉识别结果转成可追溯的结构化信息，
+驱动 Agent 的工具调用与实验记录</strong>。下面的问题按 JD 四条职责分组，每条都给"考察点 → 怎么答 → 本项目对应位置"。
+回答时优先讲<strong>取舍与失败模式</strong>，而不是罗列名词——JD 明确要求"能在真实科研场景落地"。</p>
+</blockquote>
+<h3 id="jd-职责-1科研场景-ai-agent任务理解-工具调用-上下文-多步工作流">JD 职责 1：科研场景 AI Agent（任务理解 / 工具调用 / 上下文 / 多步工作流）</h3>
+<p><strong>Q1. 为什么用工具调用，而不是让 LLM 直接生成记录文本？</strong>
+考察点：是否理解"副作用必须可校验"。
+答：生成文本无法校验，工具调用有 schema，每个副作用都能在函数里做门禁。本项目里 <code>write_experiment_record</code>
+只接受 <code>event_id</code>，读数和帧从库里反查，模型没有伪造字段的自由（见 6.4）。
+代价是多一轮往返，延迟翻倍——所以按事件类型做双系统路由（见下一条）。</p>
+<p><strong>Q2. 多步工作流怎么保证不乱序？</strong>
+答：用确定性规则兜底，不靠 prompt。<code>validate_step_order</code> 返回 <code>allowed</code>，
+<code>advance_sop_step</code> 内部<strong>再校验一次</strong>，越序直接拒绝。LLM 只是"提议"，门禁是"裁决"。
+证据：Demo 里 15.2 超限时 S4 不推进，<code>completed=['S1','S2','S3']</code>，<code>next='S4'</code>。</p>
+<p><strong>Q3. 上下文怎么管理？事件一条一条来，模型怎么知道全局状态？</strong>
+答：每次回合注入三块内容：事件本身（唯一事实源）+ 会话上下文（已完成步骤、最近事件/记录）+ 规划建议（确定性代码算出的建议动作）。
+不把整段历史塞进 prompt，避免上下文膨胀与噪声。建议看 <code>get_session_context</code> 工具与 <code>_planner_advice</code>。</p>
+<p><strong>Q4. LLM 输出不稳定，怎么保证每次结果一致？</strong>
+答：三层——① 工具幂等（<code>dedupe_key = event_id|step_id</code> 唯一索引）；② 失败回退规则 Agent（<code>status=fallback_rules</code>）；③ 安全网（模型漏写也补一条带 <code>safety net</code> 标记的记录）。
+<strong>关键立场</strong>：不追求模型确定性，追求系统确定性。</p>
+<p><strong>Q5. 长流程的延迟与成本怎么控？</strong>
+答：① 事件级触发而非逐帧调用（10 fps → 约 1 事件/秒）；② 确定性规划建议减少模型试错；③ 规则可处理的走规则（这是本项目尚未做、但 JD 会追问的双系统路由）。
+诚实回答：当前 Demo 8 个事件在 LLM 模式下约 25 秒，如果要求实时，就要引入路由与事件聚批。</p>
+<h3 id="jd-职责-2计算机视觉算法检测-分割-跟踪-ocr-读数识别-行为识别">JD 职责 2：计算机视觉算法（检测 / 分割 / 跟踪 / OCR / 读数识别 / 行为识别）</h3>
+<p><strong>Q6. 检测、跟踪、OCR 你怎么串起来？失败的优先级是什么？</strong>
+答：<code>detector → tracker → display ROI → throttled OCR → 稳定器</code>。
+失败优先级非常明确：<strong>检测到仪器但没读到数</strong>是可以接受的（读数留空、等下一帧）；
+<strong>读到一个错的数</strong>不可接受（会写进实验记录）。所以遮挡时传 <code>None</code> 而不是 0（见 3.3）。</p>
+<p><strong>Q7. 仪器读数识别，怎么处理抖动和遮挡？</strong>
+答：两层。抖动用 <code>ReadingStabilizer</code>：最近 3 个样本极差 ≤ <code>0.25 + 0.01×|读数|</code> 才算稳定，且一次跃变只发一次事件。
+遮挡用 bbox 覆盖率判定（人手覆盖显示区 ≥ 30% 就不 OCR），关键设计是<strong>不伪造读数</strong>。
+这比"提高 OCR 精度"更重要——实验室记录里，一个错误的数字比一个空值危害大得多。</p>
+<p><strong>Q8. 目标跟踪 ID 漂移怎么办？小目标/遮挡后重现怎么做？</strong>
+答：生产用 ByteTrack（运动 + 低分框二次关联），离线用 IoU 匹配。
+当前项目用 <code>object_id_map</code> 把类别映射为固定 ID 规避漂移；多台同类仪器才依赖 track id。
+<strong>该主动承认的不足</strong>：真实场景的 ID switch 没有评测覆盖，需要加 ReID 或用仪器自身的显示内容做软绑定。</p>
+<p><strong>Q9. 为什么不用分割？检测框够吗？</strong>
+答：够用，因为只需要两件事：仪器框（用来裁显示区）和人框（用来判遮挡）。
+分割的收益在"精确遮挡面积"和"手-仪器交互"，代价是标注与推理成本。若遮挡判定成为瓶颈，再引入分割或 HOI 检测。</p>
+<p><strong>Q10. OCR 用什么？中文/七段数码管/反光怎么办？</strong>
+答：生产用 PaddleOCR；离线用自建模板匹配（本项目已实现，方便复现）。
+已知弱点：PaddleOCR 会读标签文字，必须靠 <code>display_roi</code> 精确裁剪；反光会导致整段失败，靠稳定器容错。
+七段数码管建议单独训练小分类器，不要硬套通用 OCR。</p>
+<p><strong>Q11. 真实实验室的评测怎么做？</strong>
+答：这条<strong>必须答得诚实</strong>。合成基准 100% 只能证明逻辑正确（自己出卷自己批卷）。
+真实评测三条路：① 真实视频人工标注（按机位/操作者分组，两人独立标算 κ）；② 用 pending 队列的 confirmed/rejected 当免费标注（注意选择性偏差）；③ 换生产后端重测。
+详见文档第 10 章。</p>
+<h3 id="jd-职责-3视觉-agent-融合结构化信息-状态判断-事件触发-记录生成">JD 职责 3：视觉 + Agent 融合（结构化信息 / 状态判断 / 事件触发 / 记录生成）</h3>
+<p><strong>Q12. 视觉结果怎么变成 Agent 能用的结构？</strong>
+答：定义 <code>Observation</code>（单帧汇总）和 <code>LabEvent</code>（离散事实）两层。
+事件带 <code>event_id</code>、<code>source_frame</code>、<code>session_id</code>、<code>confidence</code>，Agent 只消费事件，不接触像素。
+好处：输入可复现、可审计、可离线重放。</p>
+<p><strong>Q13. 事件触发怎么避免误触发/漏触发？</strong>
+答：三条时序门槛：<code>session_start</code> 要连续 N 帧；<code>session_end</code> 要人离开 1.2 秒；
+<code>reading_change</code> 要稳定值且越过容差。误报主要由低置信度引起，进 pending 队列而不是直接丢弃。</p>
+<p><strong>Q14. 可追溯性怎么落地？模型会不会编造？</strong>
+答：记录只由 <code>event_id</code> 反查 <code>source_frame</code> 与读数，模型提供不了这两个字段。
+每帧按需落盘（内存环形缓冲 240 帧），记录点击即可回看原始画面。CLI 一条命令验证：
+<code>python -m labscribe trace &lt;record_id&gt;</code>。</p>
+<p><strong>Q15. 实验状态判断（当前做到哪一步）怎么做？</strong>
+答：SOP 进度按实验持久化（<code>progress:&lt;experiment_id&gt;</code>），跨视觉会话保留——
+人离开 1.2 秒再回来是新 session，但实验没重做。
+这是一个容易答错的点：<strong>会话 ≠ 实验</strong>。</p>
+<h3 id="jd-职责-4多模态理解视觉模型-多模态大模型-业务规则处理遮挡不确定缺失">JD 职责 4：多模态理解（视觉模型 + 多模态大模型 + 业务规则，处理遮挡/不确定/缺失）</h3>
+<p><strong>Q16. 什么时候该用 VLM，什么时候不该用？</strong>
+答：不该用：逐帧理解（贵、慢、不稳定、不可复现）。
+该用：① 低置信度帧的二次判读；② 语义步骤分类（"他是在加样还是滴定"）；③ 解释性摘要。
+本项目的取舍是"轻量视觉保证事实，LLM 负责决策"，并把 VLM 预留为 pending 复核（文档 10 章）。</p>
+<p><strong>Q17. 业务规则和模型怎么分工？</strong>
+答：规则负责<strong>不可协商的约束</strong>（顺序、范围、幂等、追溯），模型负责<strong>语义判断与措辞</strong>。
+一句话：规则当门禁，模型当参谋。反过来（模型当门禁）在真实实验室里不可接受。</p>
+<p><strong>Q18. 不确定性怎么表达？</strong>
+答：不把置信度压成一个数，而是保留来源：检测置信度、OCR 置信度、是否遮挡、原始读数。
+有效置信度取 <code>min(检测, OCR)</code>——仪器看准了但数字读糊，也不能算可信。</p>
+<p><strong>Q19. 信息缺失（没读到数、画面丢失、模型超时）怎么处理？</strong>
+答：分三类。没读到数 → 事件照发但 <code>reading=null</code>，记录里写"无稳定读数"；
+画面缺失 → 该帧不产生观测，不推断；模型超时 → 规则回退 + 安全网补记录。
+原则：<strong>宁可少写，不可写错</strong>。</p>
+<p><strong>Q20. 如果要做端到端多模态（VLA 思路），你会怎么改？</strong>
+答：这正是值得展示判断力的问题。答法：
+① 现在的动作空间是符号化的（工具调用），换连续动作没有对应物；
+② 但可借鉴 VLA 的三件事——双系统路由、动作分块（事件聚批）、提议/授权分离；
+③ 真正的端到端需要可执行技能库 + affordance 打分 + 安全门禁，且必须有人类兜底。
+（这段可参考 <code>docs/related-work.md</code> 与 VLA 对照。）</p>
+<h3 id="高频追问与陷阱题">高频追问与"陷阱题"</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话答法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>你的 100% 可信吗？</td>
+<td>不可信为真实精度；它证明逻辑正确。换真实标注重测会掉，这是预期的。</td>
+</tr>
+<tr>
+<td>为什么不用一个 VLM 端到端？</td>
+<td>逐帧多模态调用贵、慢、不稳定、不可复现；审计要的是确定性。</td>
+</tr>
+<tr>
+<td>模型幻觉怎么办？</td>
+<td>不让它提供可伪造字段；<code>event_id</code> 反查；幂等键；安全网。</td>
+</tr>
+<tr>
+<td>LLM 挂了怎么办？</td>
+<td>规则回退 + 状态标记 <code>fallback_rules</code>，记录不断。</td>
+</tr>
+<tr>
+<td>多人多仪器怎么办？</td>
+<td>当前按重叠面积分配操作者，同类仪器靠 track id；这是已知限制。</td>
+</tr>
+<tr>
+<td>延迟多少？</td>
+<td>帧处理 1.4ms；事件延迟 0.2–0.9s；LLM 回合 2–4s。分开报，不能混。</td>
+</tr>
+<tr>
+<td>为什么读数是空而不是 0？</td>
+<td>遮挡时"没看见"≠"看到 0"，写 0 是伪造。</td>
+</tr>
+<tr>
+<td>怎么证明不是过拟合？</td>
+<td>换种子重新生成留出集，442 事件仍全中；但这只排除同分布过拟合。</td>
+</tr>
+<tr>
+<td>最难的部分是什么？</td>
+<td>不是模型，是"什么时候不该相信观测"——稳定化、遮挡、置信度取 min。</td>
+</tr>
+<tr>
+<td>如果只能改一处，你改哪？</td>
+<td>双系统路由（延迟降 2/3）+ pending 当真实测试集（指标变可信），都只需几十行。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="建议的现场演示顺序10-分钟">建议的现场演示顺序（10 分钟）</h3>
+<div class="codehilite"><pre><span></span><code>1. python -m labscribe simulate --agent rules        规则链路，8 事件 / 8 记录 / 1 告警
+2. python -m labscribe trace &lt;record_id&gt;             记录 → 事件 → 原始帧
+3. python -m labscribe serve                          Dashboard：事件流、待确认、Agent 轨迹
+4. python -m labscribe eval --limit 10               指标与报告（口述 100% 的边界）
+5. 打开 docs/related-work.md                         说明你对同类方案的判断
+</code></pre></div>
+
+<p><strong>最后一句建议</strong>：面试里最有说服力的不是"我做了个 Agent"，而是
+"我知道它在什么条件下会错，以及怎么让错误不发生"。</p>
 <hr />
 <p><em>本文档由 <code>scripts/build_docs.py</code> 生成 HTML 版本；内容与仓库代码同步。</em></p>
 <footer>由 <code>scripts/build_docs.py</code> 从 <code>architecture.md</code> 生成</footer>
