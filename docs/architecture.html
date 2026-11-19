@@ -212,8 +212,8 @@ pre .codehilite, li .codehilite { background: #0a0f15; }
 
 <p><strong>阅读说明</strong>：这是一份端到端的原理文档，不需要事先了解 CV 或 LLM。
 第 3–7 节按数据流逐层拆解（代码 + 类比），第 8 节用一个真实事件串起全链路，
-第 9 节讲数据集与评测（含训练集/测试集概念），第 10 节是常见疑问。
-每节都可独立阅读，卡住时可以先跳到第 8 节看全景。</p>
+第 9 节讲数据集与评测（含训练集/测试集概念），第 10 节讲生产环境如何获得可信的真实数据，
+第 11 节是常见疑问。每节都可独立阅读，卡住时可以先跳到第 8 节看全景。</p>
 <p>常用术语速查（完整版见文末术语表）：</p>
 <table>
 <thead>
@@ -1231,7 +1231,72 @@ SOP:      completed=["S1","S2","S3"], next="S4"   ← 超限，S4 拒绝推进
 原因是当前没有被梯度更新的模型。如果将来引入学习型组件（步骤分类器、微调检测器），
 就必须先补上划分纪律，否则指标没有意义。</p>
 <h3 id="93-现有的标注集长什么样">9.3 现有的标注集长什么样</h3>
-<p><code>data/eval/annotations.jsonl</code>：首行元信息 + 每行一个场景。<strong>100 个场景，414 个标注事件</strong>。</p>
+<p>先看一个真实生成的场景（<code>python scripts/show_scenario.py --seed 105 --occluded</code>）：</p>
+<p><img alt="一个合成场景的时间切片" src="examples/scenario-preview.png" /></p>
+<p>八格是同一个场景在 8 个关键时刻的切片。蓝框是仪器、黄框是被 OCR 的显示区，
+红色边框表示显示区被手挡住（系统此时<strong>不读</strong>，而不是读成 0）：</p>
+<table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>画面</th>
+<th>标注事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>t=0.4s</td>
+<td>无人，读数 0.0</td>
+<td>—</td>
+</tr>
+<tr>
+<td>t=1.9s</td>
+<td>人到位</td>
+<td><code>session_start</code></td>
+</tr>
+<tr>
+<td>t=4.5s</td>
+<td>读数变 3.0</td>
+<td><code>reading_change</code></td>
+</tr>
+<tr>
+<td>t=6.9s</td>
+<td>人离开 1.2s 后</td>
+<td><code>session_end</code></td>
+</tr>
+<tr>
+<td>t=8.9s</td>
+<td>再次操作</td>
+<td><code>session_start</code></td>
+</tr>
+<tr>
+<td>t=9.8s</td>
+<td>手遮挡，读数跳到 15.2</td>
+<td><code>reading_change</code> + <code>anomaly</code>（标 <code>occluded: true</code>）</td>
+</tr>
+<tr>
+<td>t=10.2s</td>
+<td>仍在遮挡中</td>
+<td>系统按兵不动</td>
+</tr>
+<tr>
+<td>t=13.4s</td>
+<td>手移开，读数 15.2 稳定</td>
+<td><code>session_end</code></td>
+</tr>
+</tbody>
+</table>
+<p>对应的标注 JSON 正是这样（注意 <code>window</code> 给遮挡事件留了更长的匹配窗口）：</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"session_start"</span><span class="p">,</span><span class="w">  </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.57</span><span class="p">,</span><span class="w">  </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">1.37</span><span class="p">,</span><span class="w"> </span><span class="mf">2.77</span><span class="p">],</span><span class="w">  </span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w">  </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"reading_change"</span><span class="p">,</span><span class="w"> </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.1</span><span class="p">,</span><span class="w">   </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">3.9</span><span class="p">,</span><span class="w"> </span><span class="mf">5.9</span><span class="p">],</span><span class="w">    </span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.0</span><span class="p">,</span><span class="w">  </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"session_end"</span><span class="p">,</span><span class="w">    </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.74</span><span class="p">,</span><span class="w">  </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">5.94</span><span class="p">,</span><span class="w"> </span><span class="mf">8.04</span><span class="p">],</span><span class="w">  </span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.0</span><span class="p">,</span><span class="w">  </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"session_start"</span><span class="p">,</span><span class="w">  </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.55</span><span class="p">,</span><span class="w">  </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">8.35</span><span class="p">,</span><span class="w"> </span><span class="mf">9.75</span><span class="p">],</span><span class="w">  </span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.0</span><span class="p">,</span><span class="w">  </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"anomaly"</span><span class="p">,</span><span class="w">        </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.78</span><span class="p">,</span><span class="w">  </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">9.58</span><span class="p">,</span><span class="w"> </span><span class="mf">12.18</span><span class="p">],</span><span class="w"> </span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">15.2</span><span class="p">,</span><span class="w"> </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"reading_change"</span><span class="p">,</span><span class="w"> </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.78</span><span class="p">,</span><span class="w">  </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">9.58</span><span class="p">,</span><span class="w"> </span><span class="mf">12.18</span><span class="p">],</span><span class="w"> </span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">15.2</span><span class="p">,</span><span class="w"> </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"session_end"</span><span class="p">,</span><span class="w">    </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.23</span><span class="p">,</span><span class="w"> </span><span class="nt">"window"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mf">12.43</span><span class="p">,</span><span class="w"> </span><span class="mf">14.53</span><span class="p">],</span><span class="nt">"reading"</span><span class="p">:</span><span class="w"> </span><span class="mf">15.2</span><span class="p">,</span><span class="w"> </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">}</span>
+</code></pre></div>
+
+<p>文件 <code>data/eval/annotations.jsonl</code>：首行元信息 + 每行一个场景。<strong>100 个场景，414 个标注事件</strong>。</p>
 <div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="nt">"dataset"</span><span class="p">:</span><span class="w"> </span><span class="s2">"labsynthetic-events-v1"</span><span class="p">,</span><span class="w"> </span><span class="nt">"count"</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="nt">"seed"</span><span class="p">:</span><span class="w"> </span><span class="mi">20260101</span><span class="p">,</span><span class="w"> </span><span class="nt">"occluded_scenarios"</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">}</span>
 <span class="p">{</span><span class="nt">"scenario_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"eval-001"</span><span class="p">,</span><span class="w"> </span><span class="nt">"seed"</span><span class="p">:</span><span class="w"> </span><span class="mi">20260102</span><span class="p">,</span><span class="w"> </span><span class="nt">"occluded"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"fps"</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="nt">"duration"</span><span class="p">:</span><span class="w"> </span><span class="mf">14.71</span><span class="p">,</span>
 <span class="w"> </span><span class="nt">"detector_dropouts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">124</span><span class="p">,</span><span class="w"> </span><span class="mi">125</span><span class="p">,</span><span class="w"> </span><span class="mi">126</span><span class="p">,</span><span class="w"> </span><span class="mi">127</span><span class="p">],</span>
@@ -1458,22 +1523,209 @@ F1        = 2PR / (P + R)      两者的调和平均
 <p>报告里记录了当时用的后端（<code>system.detector/tracker/ocr</code>），一眼能看出是离线还是生产。</p>
 <p><strong>第三，Agent 完全没有被这套评测覆盖。</strong>
 上面的指标只评"视觉 + 事件层"。LLM 写记录的<strong>正确性</strong>（措辞是否准确、步骤归属是否对、
-有没有幻觉）不在这个基准里。这是一个明确的缺口，补法见 9.8。</p>
-<h3 id="98-最诚实的一种评测把人工确认当标注">9.8 最诚实的一种评测：把人工确认当标注</h3>
-<p>系统里已经有一个<strong>免费的真实标注来源</strong>——<code>pending</code> 队列。</p>
-<div class="codehilite"><pre><span></span><code>pending.status = confirmed  →  人认为"这里应该有一个事件"      → 可以当 TP/真值
-pending.status = rejected   →  人认为"这里不该有事件"          → 可以当 FP
+有没有幻觉）不在这个基准里。这是一个明确的缺口，补法见第 10 章。</p>
+<h3 id="98-数据来源的性质自己出卷自己批卷">9.8 数据来源的性质：自己出卷、自己批卷</h3>
+<p>必须说清楚：<strong>没人打分，打分是代码算的；标注也是代码生成的。</strong></p>
+<div class="codehilite"><pre><span></span><code>synthetic.py  _ground_truth()   生成场景时从"剧本"推出标准答案
+        │
+harness.py    run_scenario()    系统盲跑，产出预测
+        │
+harness.py    _match_scenario() 按类型 + 时间窗口一对一配对
+        │
+harness.py    metrics()         TP/FP/FN → precision / recall / F1
 </code></pre></div>
 
-<p>这比任何合成基准都有说服力，因为标注来自真实使用。落地方式：</p>
-<div class="codehilite"><pre><span></span><code><span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">pending</span> <span class="p">-</span><span class="n">-status</span> <span class="n">confirmed</span>   <span class="c"># 查看已确认样本</span>
-<span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">pending</span> <span class="p">-</span><span class="n">-status</span> <span class="n">rejected</span>    <span class="c"># 查看被否决的误报</span>
-</code></pre></div>
-
-<p>思路是把这两类导出成 JSONL（格式与 9.3 一致），形成<strong>真实场景测试集</strong>，
-再和合成基准并列报告。这件事尚未实现，但数据结构已经齐了，只差一个导出命令。</p>
+<p>出题（<code>make_scenario</code>）、答案（<code>_ground_truth</code>）、评分器（<code>_match_scenario</code>）、
+被测系统（<code>pipeline</code> + <code>state_machine</code>）四者共享同一套假设：颜色标记、同一字体模板、
+同样的时间常数。所以 100% 是<strong>逻辑自洽的证据</strong>，不是真实能力的证据。</p>
+<blockquote>
+<p><strong>类比：自己出卷、自己写答案、自己批卷。</strong> 考 100 分毫不意外；真正有说服力的是拿别人出的卷子考。</p>
+</blockquote>
+<p>怎么拿到"别人出的卷子"，见下一章。</p>
 <hr />
-<h2 id="10-设计取舍-faq">10. 设计取舍 FAQ</h2>
+<h2 id="10-生产环境下的数据策略">10. 生产环境下的数据策略</h2>
+<p>合成数据只能证明逻辑正确。要回答"在真实实验室里能不能用"，必须换真实数据。
+这里有三条路，按<strong>投入成本从低到高</strong>排列，建议按顺序都走一遍。</p>
+<h3 id="101-策略一真实视频-人工标注事件边界">10.1 策略一：真实视频 + 人工标注事件边界</h3>
+<p><strong>做法</strong>：录真实实验室视频，由熟悉流程的人标出事件边界，导出成与合成集同格式的 JSONL，
+直接用现有的 eval 跑。</p>
+<div class="codehilite"><pre><span></span><code>{"scenario_id": "labA-2026-11-20-titration-01", "seed": 0, "occluded": false,
+ "fps": 25, "duration": 183.4,
+ "video": "data/real/labA-2026-11-20.mp4",
+ "detector_dropouts": [],
+ "events": [
+   {"type": "session_start",  "t": 12.4,  "window": [11.9, 14.4], "reading": 0.0,  "occluded": false},
+   {"type": "reading_change", "t": 48.7,  "window": [47.7, 51.7], "reading": 3.5,  "occluded": false}
+ ],
+ "spec": {}}
+</code></pre></div>
+
+<p>标注纪律（否则指标没有意义）：</p>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>按视频/机位/日期分组划分</strong>，不要按帧</td>
+<td>同一段视频的相邻帧高度相似，按帧分会让测试集偷看训练集</td>
+</tr>
+<tr>
+<td>测试视频选<strong>不同操作者、不同光照、不同仪器型号</strong></td>
+<td>这才是"泛化"，同条件重复只是"记忆"</td>
+</tr>
+<tr>
+<td><code>window</code> 按业务可接受延迟设定，不要为了好看放宽</td>
+<td>窗口越宽指标越好看，但延迟承诺会失真</td>
+</tr>
+<tr>
+<td>标注时<strong>只看画面</strong>，不看系统输出</td>
+<td>否则会不自觉地把系统的错误当成标准答案</td>
+</tr>
+<tr>
+<td>至少两人独立标注，算 <strong>一致性（Cohen's κ）</strong></td>
+<td>连人都标不一致的地方，机器错了情有可原</td>
+</tr>
+</tbody>
+</table>
+<p><strong>代价</strong>：一条 3 分钟视频人工标注约 20–40 分钟；想覆盖 20 种场景，需要 1–2 人周。</p>
+<p><strong>半自动做法（推荐）</strong>：用系统先跑一遍，导出它的预测，让人<strong>只修正、不从零标</strong>。
+这叫 <strong>model-assisted annotation</strong>，通常能省 50–70% 时间，代价是要防止"人跟着系统走"的确认偏差——
+所以每位标注员必须抽查 10% 的帧<strong>独立重标</strong>，用来估计偏差。</p>
+<p><strong>当前状态</strong>：<code>labscribe/eval/dataset.py</code> 的加载格式已兼容（多一个 <code>video</code> 字段即可），
+但 <code>harness.run_scenario</code> 目前只从合成场景取帧。要用真实视频需要补一个入口——
+这是仓库里明确<strong>尚未实现</strong>的一处。</p>
+<h3 id="102-策略二把待确认队列变成真实测试集成本最低">10.2 策略二：把待确认队列变成真实测试集（成本最低）</h3>
+<p>系统里已经有一个<strong>免费的真实标注来源</strong>——<code>pending</code> 队列。</p>
+<div class="codehilite"><pre><span></span><code>pending.status = confirmed  →  操作员认为"这里应该有一个事件"   → 真值（TP 来源）
+pending.status = rejected   →  操作员认为"这里不该有事件"       → 误报证据（FP 来源）
+</code></pre></div>
+
+<p>这不是"顺便"用一下：它是<strong>唯一由真人做出的判断</strong>，比任何自己生成的标注都可信。
+落地只需导出成 JSONL：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">pending</span> <span class="p">-</span><span class="n">-status</span> <span class="n">confirmed</span>   <span class="c"># 已确认</span>
+<span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">pending</span> <span class="p">-</span><span class="n">-status</span> <span class="n">rejected</span>    <span class="c"># 已否决</span>
+</code></pre></div>
+
+<p>导出字段映射：</p>
+<table>
+<thead>
+<tr>
+<th>pending 字段</th>
+<th>标注字段</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kind</code></td>
+<td><code>events[].type</code></td>
+<td>候选事件类型</td>
+</tr>
+<tr>
+<td><code>draft_event.ts</code></td>
+<td><code>events[].t</code></td>
+<td>事件时刻</td>
+</tr>
+<tr>
+<td><code>draft_event.reading</code></td>
+<td><code>events[].reading</code></td>
+<td>候选读数</td>
+</tr>
+<tr>
+<td><code>draft_event.object_id</code></td>
+<td><code>events[].object_id</code></td>
+<td>仪器</td>
+</tr>
+<tr>
+<td><code>source_frame</code></td>
+<td>证据帧</td>
+<td>保留了原始画面，可直接复核</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td><code>confirmed</code> / <code>rejected</code></td>
+<td>决定计入真值还是误报</td>
+</tr>
+</tbody>
+</table>
+<p>注意两个陷阱：</p>
+<ol>
+<li><strong>选择性偏差</strong>：pending 只收低置信度样本，不代表整体分布。用它算出的数字应报告为
+   "<strong>低置信度子集上的指标</strong>"，不能直接当全局精度；</li>
+<li><strong>确认偏差</strong>：如果操作员倾向于点"确认"，<code>rejected</code> 会偏少，precision 会被高估。
+   应对方法是定期让操作员<strong>盲审</strong>一批系统判为"高置信度已确认"的事件，统计其中错的比例。</li>
+</ol>
+<p><strong>当前状态</strong>：数据和表结构都已具备，缺一个 <code>labscribe export-pending</code> 命令（约 40 行）。
+这是三条路里<strong>性价比最高的一条</strong>，建议优先补。</p>
+<h3 id="103-策略三换生产后端后重跑">10.3 策略三：换生产后端后重跑</h3>
+<p>前两条解决"数据从哪来"，这条解决"识别器是否够强"。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">python</span> <span class="n">-m</span> <span class="n">pip</span> <span class="n">install</span> <span class="n">-r</span> <span class="n">requirements-vision</span><span class="p">.</span><span class="n">txt</span>   <span class="c"># YOLO11 + ByteTrack + PaddleOCR</span>
+<span class="n">python</span> <span class="n">-m</span> <span class="n">labscribe</span> <span class="n">eval</span> <span class="p">-</span><span class="n">-dataset</span> <span class="n">data</span><span class="p">/</span><span class="n">real</span><span class="p">/</span><span class="n">labA</span><span class="p">.</span><span class="n">jsonl</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="nt">vision</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">detector</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yolo11</span>
+<span class="w">  </span><span class="nt">detector_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">weights/lab_instruments.pt</span>
+<span class="w">  </span><span class="nt">tracker</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bytetrack</span>
+<span class="w">  </span><span class="nt">ocr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">paddle</span>
+<span class="w">  </span><span class="nt">class_map</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> person</span><span class="p">:</span><span class="w"> </span><span class="nv">actor</span><span class="p p-Indicator">,</span><span class="nt"> titrator</span><span class="p">:</span><span class="w"> </span><span class="nv">instrument</span><span class="p p-Indicator">,</span><span class="nt"> spectrophotometer</span><span class="p">:</span><span class="w"> </span><span class="nv">instrument</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">  </span><span class="nt">object_id_map</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span>
+</code></pre></div>
+
+<p>预期会看到的现象（先说清楚，避免误判为"改坏了"）：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>变化</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>事件 recall</td>
+<td><strong>下降</strong></td>
+<td>真实场景有反光、运动模糊、遮挡，检测会漏</td>
+</tr>
+<tr>
+<td>事件 precision</td>
+<td>可能下降</td>
+<td>PaddleOCR 会读出标签上的数字（如"25.0 mL"），需靠 <code>display_roi</code> 精确裁剪</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td><strong>上升</strong></td>
+<td>YOLO + Paddle 每帧 20–80ms，不再是 1.4ms</td>
+</tr>
+<tr>
+<td>遮挡 recall</td>
+<td>下降明显</td>
+<td>真实遮挡是透明/部分遮挡，bbox 覆盖率不再准确</td>
+</tr>
+</tbody>
+</table>
+<p>这些下降是<strong>正常的、也是必要的</strong>——它说明评测终于开始测量真实困难了。
+报告里 <code>system.detector/tracker/ocr</code> 会记录使用的后端，方便对比。</p>
+<p>调优顺序建议：先把 <code>display_roi</code> 标定准（收益最大），再调 <code>min_detection</code>，
+最后才考虑换模型或微调。</p>
+<h3 id="104-三条路怎么配合">10.4 三条路怎么配合</h3>
+<div class="codehilite"><pre><span></span><code>上线前                          上线中                     上线后
+   │                               │                          │
+真实视频 + 人工标注（10.1）        待确认队列盲审（10.2）      持续累积 confirmed/rejected
+   │                               │                          │
+换生产后端重跑（10.3）──── 得到可信基线 ────► 定期回归对比 ────► 真实测试集越来越厚
+   │                                                             │
+   └──────────────► 若指标不够 → 微调检测器/OCR ─────────────────┘
+</code></pre></div>
+
+<p>一句话总结：<strong>合成数据用来做 CI 回归（快、便宜、稳定），真实数据用来做验收（慢、贵、可信），
+待确认队列用来做长期监控（免费、持续、有偏差）。三者口径不同，不能混着报数。</strong></p>
+<hr />
+<h2 id="11-设计取舍-faq">11. 设计取舍 FAQ</h2>
 <p><strong>Q1：为什么不直接让 VLM 看图写记录？</strong>
 贵（每帧一次多模态调用）、慢（无法跟上 10 fps）、不稳定（同一画面不同回答）、不可复现（审计要的是确定性）。项目的做法是"轻量视觉保证事实，LLM 负责决策"。</p>
 <p><strong>Q2：为什么异常要单独一个事件，不合并进 reading_change？</strong>
@@ -1493,11 +1745,11 @@ pending.status = rejected   →  人认为"这里不该有事件"          → �
 <p><strong>Q9：为什么不划分训练集/验证集/测试集？</strong>
 因为链路里没有被梯度更新的模型：状态机是手写阈值，LLM 是现成模型 + prompt，离线检测/OCR 是颜色与模板匹配。没有训练，就不存在"训练集"。现有 100 个场景按用途属于<strong>验证 + 测试</strong>：阈值是在 Demo 上看着调的（验证），另用新种子生成的一份留出集做最终报数（测试）。将来若引入学习型组件（步骤分类器、微调检测器），必须补上按场景分组的 train/val/test 划分，详见 9.4。</p>
 <p><strong>Q10：100% 是不是刷出来的？</strong>
-不是刷的，但有边界。它只覆盖"视觉 + 事件层"，且数据由合成器生成、识别器与渲染器共享假设（域泄漏）。它证明的是事件折叠逻辑正确、遮挡不伪造读数、阈值稳健；它<strong>不</strong>证明真实摄像头精度，也<strong>不</strong>覆盖 LLM 写记录的正确性。换新种子重新生成的留出集同样是 100%，说明不是过拟合这 100 个场景；但真实场景的指标必须用真实标注重测，见 9.7。</p>
+不是刷的，但有边界。它只覆盖"视觉 + 事件层"，且数据由合成器生成、识别器与渲染器共享假设（域泄漏）。它证明的是事件折叠逻辑正确、遮挡不伪造读数、阈值稳健；它<strong>不</strong>证明真实摄像头精度，也<strong>不</strong>覆盖 LLM 写记录的正确性。换新种子重新生成的留出集同样是 100%，说明不是过拟合这 100 个场景；但真实场景的指标必须用真实标注重测，见 9.7 与第 10 章。</p>
 <p><strong>Q11：怎么判断改了一个阈值后是变好还是变坏？</strong>
 先在开发集上跑（可以随便调），再在留出集上跑一次确认。只有留出集不退化才算改进。<code>reports/eval_report.json</code> 保留每次的 <code>per_scenario</code> 明细，可直接做前后对比。</p>
 <hr />
-<h2 id="11-代码地图">11. 代码地图</h2>
+<h2 id="12-代码地图">12. 代码地图</h2>
 <div class="codehilite"><pre><span></span><code>labscribe/
 ├─ schema.py                # BBox / Detection / Frame / Observation / LabEvent / SOP / Record
 ├─ config.py                # YAML + .env + 环境变量覆盖
@@ -1541,7 +1793,7 @@ pending.status = rejected   →  人认为"这里不该有事件"          → �
 <li><code>eval/harness.py</code> —— 如何证明它有效。</li>
 </ol>
 <hr />
-<h2 id="12-如何扩展">12. 如何扩展</h2>
+<h2 id="13-如何扩展">13. 如何扩展</h2>
 <table>
 <thead>
 <tr>
@@ -1691,6 +1943,18 @@ pending.status = rejected   →  人认为"这里不该有事件"          → �
 <tr>
 <td><strong>域泄漏 Domain leakage</strong></td>
 <td>合成数据与识别器共享假设，导致分数不具真实代表性</td>
+</tr>
+<tr>
+<td><strong>Cohen's κ</strong></td>
+<td>两名标注者一致性指标，用于检验标注质量</td>
+</tr>
+<tr>
+<td><strong>model-assisted annotation</strong></td>
+<td>系统先跑一遍、人只做修正的半自动标注法</td>
+</tr>
+<tr>
+<td><strong>选择性偏差</strong></td>
+<td>只统计某类样本（如低置信度）导致的指标失真</td>
 </tr>
 </tbody>
 </table>

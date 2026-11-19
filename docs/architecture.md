@@ -25,8 +25,8 @@ LabScribe 做一件事：**把摄像头里的"人在用仪器做实验"自动变
 
 **阅读说明**：这是一份端到端的原理文档，不需要事先了解 CV 或 LLM。
 第 3–7 节按数据流逐层拆解（代码 + 类比），第 8 节用一个真实事件串起全链路，
-第 9 节讲数据集与评测（含训练集/测试集概念），第 10 节是常见疑问。
-每节都可独立阅读，卡住时可以先跳到第 8 节看全景。
+第 9 节讲数据集与评测（含训练集/测试集概念），第 10 节讲生产环境如何获得可信的真实数据，
+第 11 节是常见疑问。每节都可独立阅读，卡住时可以先跳到第 8 节看全景。
 
 常用术语速查（完整版见文末术语表）：
 
@@ -832,7 +832,37 @@ SOP:      completed=["S1","S2","S3"], next="S4"   ← 超限，S4 拒绝推进
 
 ### 9.3 现有的标注集长什么样
 
-`data/eval/annotations.jsonl`：首行元信息 + 每行一个场景。**100 个场景，414 个标注事件**。
+先看一个真实生成的场景（`python scripts/show_scenario.py --seed 105 --occluded`）：
+
+![一个合成场景的时间切片](examples/scenario-preview.png)
+
+八格是同一个场景在 8 个关键时刻的切片。蓝框是仪器、黄框是被 OCR 的显示区，
+红色边框表示显示区被手挡住（系统此时**不读**，而不是读成 0）：
+
+| 时刻 | 画面 | 标注事件 |
+| --- | --- | --- |
+| t=0.4s | 无人，读数 0.0 | — |
+| t=1.9s | 人到位 | `session_start` |
+| t=4.5s | 读数变 3.0 | `reading_change` |
+| t=6.9s | 人离开 1.2s 后 | `session_end` |
+| t=8.9s | 再次操作 | `session_start` |
+| t=9.8s | 手遮挡，读数跳到 15.2 | `reading_change` + `anomaly`（标 `occluded: true`） |
+| t=10.2s | 仍在遮挡中 | 系统按兵不动 |
+| t=13.4s | 手移开，读数 15.2 稳定 | `session_end` |
+
+对应的标注 JSON 正是这样（注意 `window` 给遮挡事件留了更长的匹配窗口）：
+
+```json
+{"type": "session_start",  "t": 1.57,  "window": [1.37, 2.77],  "reading": 0.0,  "occluded": false}
+{"type": "reading_change", "t": 4.1,   "window": [3.9, 5.9],    "reading": 3.0,  "occluded": false}
+{"type": "session_end",    "t": 6.74,  "window": [5.94, 8.04],  "reading": 3.0,  "occluded": false}
+{"type": "session_start",  "t": 8.55,  "window": [8.35, 9.75],  "reading": 3.0,  "occluded": false}
+{"type": "anomaly",        "t": 9.78,  "window": [9.58, 12.18], "reading": 15.2, "occluded": true}
+{"type": "reading_change", "t": 9.78,  "window": [9.58, 12.18], "reading": 15.2, "occluded": true}
+{"type": "session_end",    "t": 13.23, "window": [12.43, 14.53],"reading": 15.2, "occluded": false}
+```
+
+文件 `data/eval/annotations.jsonl`：首行元信息 + 每行一个场景。**100 个场景，414 个标注事件**。
 
 ```json
 {"dataset": "labsynthetic-events-v1", "count": 100, "seed": 20260101, "occluded_scenarios": 20}
@@ -964,30 +994,164 @@ python -m labscribe eval                            # 在真实标注上重跑
 
 **第三，Agent 完全没有被这套评测覆盖。**
 上面的指标只评"视觉 + 事件层"。LLM 写记录的**正确性**（措辞是否准确、步骤归属是否对、
-有没有幻觉）不在这个基准里。这是一个明确的缺口，补法见 9.8。
+有没有幻觉）不在这个基准里。这是一个明确的缺口，补法见第 10 章。
 
-### 9.8 最诚实的一种评测：把人工确认当标注
+### 9.8 数据来源的性质：自己出卷、自己批卷
+
+必须说清楚：**没人打分，打分是代码算的；标注也是代码生成的。**
+
+```text
+synthetic.py  _ground_truth()   生成场景时从"剧本"推出标准答案
+        │
+harness.py    run_scenario()    系统盲跑，产出预测
+        │
+harness.py    _match_scenario() 按类型 + 时间窗口一对一配对
+        │
+harness.py    metrics()         TP/FP/FN → precision / recall / F1
+```
+
+出题（`make_scenario`）、答案（`_ground_truth`）、评分器（`_match_scenario`）、
+被测系统（`pipeline` + `state_machine`）四者共享同一套假设：颜色标记、同一字体模板、
+同样的时间常数。所以 100% 是**逻辑自洽的证据**，不是真实能力的证据。
+
+> **类比：自己出卷、自己写答案、自己批卷。** 考 100 分毫不意外；真正有说服力的是拿别人出的卷子考。
+
+怎么拿到"别人出的卷子"，见下一章。
+
+---
+
+## 10. 生产环境下的数据策略
+
+合成数据只能证明逻辑正确。要回答"在真实实验室里能不能用"，必须换真实数据。
+这里有三条路，按**投入成本从低到高**排列，建议按顺序都走一遍。
+
+### 10.1 策略一：真实视频 + 人工标注事件边界
+
+**做法**：录真实实验室视频，由熟悉流程的人标出事件边界，导出成与合成集同格式的 JSONL，
+直接用现有的 eval 跑。
+
+```jsonl
+{"scenario_id": "labA-2026-11-20-titration-01", "seed": 0, "occluded": false,
+ "fps": 25, "duration": 183.4,
+ "video": "data/real/labA-2026-11-20.mp4",
+ "detector_dropouts": [],
+ "events": [
+   {"type": "session_start",  "t": 12.4,  "window": [11.9, 14.4], "reading": 0.0,  "occluded": false},
+   {"type": "reading_change", "t": 48.7,  "window": [47.7, 51.7], "reading": 3.5,  "occluded": false}
+ ],
+ "spec": {}}
+```
+
+标注纪律（否则指标没有意义）：
+
+| 规则 | 原因 |
+| --- | --- |
+| **按视频/机位/日期分组划分**，不要按帧 | 同一段视频的相邻帧高度相似，按帧分会让测试集偷看训练集 |
+| 测试视频选**不同操作者、不同光照、不同仪器型号** | 这才是"泛化"，同条件重复只是"记忆" |
+| `window` 按业务可接受延迟设定，不要为了好看放宽 | 窗口越宽指标越好看，但延迟承诺会失真 |
+| 标注时**只看画面**，不看系统输出 | 否则会不自觉地把系统的错误当成标准答案 |
+| 至少两人独立标注，算 **一致性（Cohen's κ）** | 连人都标不一致的地方，机器错了情有可原 |
+
+**代价**：一条 3 分钟视频人工标注约 20–40 分钟；想覆盖 20 种场景，需要 1–2 人周。
+
+**半自动做法（推荐）**：用系统先跑一遍，导出它的预测，让人**只修正、不从零标**。
+这叫 **model-assisted annotation**，通常能省 50–70% 时间，代价是要防止"人跟着系统走"的确认偏差——
+所以每位标注员必须抽查 10% 的帧**独立重标**，用来估计偏差。
+
+**当前状态**：`labscribe/eval/dataset.py` 的加载格式已兼容（多一个 `video` 字段即可），
+但 `harness.run_scenario` 目前只从合成场景取帧。要用真实视频需要补一个入口——
+这是仓库里明确**尚未实现**的一处。
+
+### 10.2 策略二：把待确认队列变成真实测试集（成本最低）
 
 系统里已经有一个**免费的真实标注来源**——`pending` 队列。
 
 ```text
-pending.status = confirmed  →  人认为"这里应该有一个事件"      → 可以当 TP/真值
-pending.status = rejected   →  人认为"这里不该有事件"          → 可以当 FP
+pending.status = confirmed  →  操作员认为"这里应该有一个事件"   → 真值（TP 来源）
+pending.status = rejected   →  操作员认为"这里不该有事件"       → 误报证据（FP 来源）
 ```
 
-这比任何合成基准都有说服力，因为标注来自真实使用。落地方式：
+这不是"顺便"用一下：它是**唯一由真人做出的判断**，比任何自己生成的标注都可信。
+落地只需导出成 JSONL：
 
 ```powershell
-python -m labscribe pending --status confirmed   # 查看已确认样本
-python -m labscribe pending --status rejected    # 查看被否决的误报
+python -m labscribe pending --status confirmed   # 已确认
+python -m labscribe pending --status rejected    # 已否决
 ```
 
-思路是把这两类导出成 JSONL（格式与 9.3 一致），形成**真实场景测试集**，
-再和合成基准并列报告。这件事尚未实现，但数据结构已经齐了，只差一个导出命令。
+导出字段映射：
+
+| pending 字段 | 标注字段 | 说明 |
+| --- | --- | --- |
+| `kind` | `events[].type` | 候选事件类型 |
+| `draft_event.ts` | `events[].t` | 事件时刻 |
+| `draft_event.reading` | `events[].reading` | 候选读数 |
+| `draft_event.object_id` | `events[].object_id` | 仪器 |
+| `source_frame` | 证据帧 | 保留了原始画面，可直接复核 |
+| `status` | `confirmed` / `rejected` | 决定计入真值还是误报 |
+
+注意两个陷阱：
+
+1. **选择性偏差**：pending 只收低置信度样本，不代表整体分布。用它算出的数字应报告为
+   "**低置信度子集上的指标**"，不能直接当全局精度；
+2. **确认偏差**：如果操作员倾向于点"确认"，`rejected` 会偏少，precision 会被高估。
+   应对方法是定期让操作员**盲审**一批系统判为"高置信度已确认"的事件，统计其中错的比例。
+
+**当前状态**：数据和表结构都已具备，缺一个 `labscribe export-pending` 命令（约 40 行）。
+这是三条路里**性价比最高的一条**，建议优先补。
+
+### 10.3 策略三：换生产后端后重跑
+
+前两条解决"数据从哪来"，这条解决"识别器是否够强"。
+
+```powershell
+python -m pip install -r requirements-vision.txt   # YOLO11 + ByteTrack + PaddleOCR
+python -m labscribe eval --dataset data/real/labA.jsonl
+```
+
+```yaml
+vision:
+  detector: yolo11
+  detector_model: weights/lab_instruments.pt
+  tracker: bytetrack
+  ocr: paddle
+  class_map: { person: actor, titrator: instrument, spectrophotometer: instrument }
+  object_id_map: {}
+```
+
+预期会看到的现象（先说清楚，避免误判为"改坏了"）：
+
+| 指标 | 变化 | 原因 |
+| --- | --- | --- |
+| 事件 recall | **下降** | 真实场景有反光、运动模糊、遮挡，检测会漏 |
+| 事件 precision | 可能下降 | PaddleOCR 会读出标签上的数字（如"25.0 mL"），需靠 `display_roi` 精确裁剪 |
+| 延迟 | **上升** | YOLO + Paddle 每帧 20–80ms，不再是 1.4ms |
+| 遮挡 recall | 下降明显 | 真实遮挡是透明/部分遮挡，bbox 覆盖率不再准确 |
+
+这些下降是**正常的、也是必要的**——它说明评测终于开始测量真实困难了。
+报告里 `system.detector/tracker/ocr` 会记录使用的后端，方便对比。
+
+调优顺序建议：先把 `display_roi` 标定准（收益最大），再调 `min_detection`，
+最后才考虑换模型或微调。
+
+### 10.4 三条路怎么配合
+
+```text
+上线前                          上线中                     上线后
+   │                               │                          │
+真实视频 + 人工标注（10.1）        待确认队列盲审（10.2）      持续累积 confirmed/rejected
+   │                               │                          │
+换生产后端重跑（10.3）──── 得到可信基线 ────► 定期回归对比 ────► 真实测试集越来越厚
+   │                                                             │
+   └──────────────► 若指标不够 → 微调检测器/OCR ─────────────────┘
+```
+
+一句话总结：**合成数据用来做 CI 回归（快、便宜、稳定），真实数据用来做验收（慢、贵、可信），
+待确认队列用来做长期监控（免费、持续、有偏差）。三者口径不同，不能混着报数。**
 
 ---
 
-## 10. 设计取舍 FAQ
+## 11. 设计取舍 FAQ
 
 **Q1：为什么不直接让 VLM 看图写记录？**
 贵（每帧一次多模态调用）、慢（无法跟上 10 fps）、不稳定（同一画面不同回答）、不可复现（审计要的是确定性）。项目的做法是"轻量视觉保证事实，LLM 负责决策"。
@@ -1017,14 +1181,14 @@ python -m labscribe pending --status rejected    # 查看被否决的误报
 因为链路里没有被梯度更新的模型：状态机是手写阈值，LLM 是现成模型 + prompt，离线检测/OCR 是颜色与模板匹配。没有训练，就不存在"训练集"。现有 100 个场景按用途属于**验证 + 测试**：阈值是在 Demo 上看着调的（验证），另用新种子生成的一份留出集做最终报数（测试）。将来若引入学习型组件（步骤分类器、微调检测器），必须补上按场景分组的 train/val/test 划分，详见 9.4。
 
 **Q10：100% 是不是刷出来的？**
-不是刷的，但有边界。它只覆盖"视觉 + 事件层"，且数据由合成器生成、识别器与渲染器共享假设（域泄漏）。它证明的是事件折叠逻辑正确、遮挡不伪造读数、阈值稳健；它**不**证明真实摄像头精度，也**不**覆盖 LLM 写记录的正确性。换新种子重新生成的留出集同样是 100%，说明不是过拟合这 100 个场景；但真实场景的指标必须用真实标注重测，见 9.7。
+不是刷的，但有边界。它只覆盖"视觉 + 事件层"，且数据由合成器生成、识别器与渲染器共享假设（域泄漏）。它证明的是事件折叠逻辑正确、遮挡不伪造读数、阈值稳健；它**不**证明真实摄像头精度，也**不**覆盖 LLM 写记录的正确性。换新种子重新生成的留出集同样是 100%，说明不是过拟合这 100 个场景；但真实场景的指标必须用真实标注重测，见 9.7 与第 10 章。
 
 **Q11：怎么判断改了一个阈值后是变好还是变坏？**
 先在开发集上跑（可以随便调），再在留出集上跑一次确认。只有留出集不退化才算改进。`reports/eval_report.json` 保留每次的 `per_scenario` 明细，可直接做前后对比。
 
 ---
 
-## 11. 代码地图
+## 12. 代码地图
 
 ```text
 labscribe/
@@ -1071,7 +1235,7 @@ labscribe/
 
 ---
 
-## 12. 如何扩展
+## 13. 如何扩展
 
 | 想做的事 | 改哪里 | 说明 |
 | --- | --- | --- |
@@ -1112,6 +1276,9 @@ labscribe/
 | **Precision / Recall / F1** | 报准的比例 / 找全的比例 / 两者调和平均 |
 | **k 折交叉验证** | 数据少时轮流留一份做验证，跑 k 次取平均 |
 | **域泄漏 Domain leakage** | 合成数据与识别器共享假设，导致分数不具真实代表性 |
+| **Cohen's κ** | 两名标注者一致性指标，用于检验标注质量 |
+| **model-assisted annotation** | 系统先跑一遍、人只做修正的半自动标注法 |
+| **选择性偏差** | 只统计某类样本（如低置信度）导致的指标失真 |
 
 ---
 
