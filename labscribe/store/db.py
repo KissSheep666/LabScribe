@@ -338,6 +338,56 @@ class Database:
             rows = self._query("SELECT * FROM records ORDER BY created_at DESC LIMIT ?", (int(limit),))
         return [json.loads(r["payload"]) for r in rows]
 
+    def search_records(
+        self,
+        text: str | None = None,
+        session_id: str | None = None,
+        step_id: str | None = None,
+        object_id: str | None = None,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Filter archived records. ``text`` matches note/step/event/object."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if step_id:
+            clauses.append("step_id = ?")
+            params.append(step_id)
+        if object_id:
+            clauses.append("object_id = ?")
+            params.append(object_id)
+        if since_ts is not None:
+            clauses.append("created_at >= ?")
+            params.append(since_ts)
+        if until_ts is not None:
+            clauses.append("created_at <= ?")
+            params.append(until_ts)
+        if text:
+            like = f"%{text}%"
+            clauses.append(
+                "(note LIKE ? OR step_id LIKE ? OR event_id LIKE ? OR object_id LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._query(
+            f"SELECT * FROM records {where} ORDER BY created_at DESC LIMIT ?",
+            (*params, int(limit)),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def readings_for_step(self, experiment_id: str, step_id: str, limit: int = 200) -> list[float]:
+        rows = self._query(
+            """SELECT reading FROM records
+               WHERE experiment_id=? AND step_id=? AND reading IS NOT NULL
+               ORDER BY created_at DESC LIMIT ?""",
+            (experiment_id, step_id, int(limit)),
+        )
+        return [float(r["reading"]) for r in rows]
+
     def record_for_event(self, event_id: str, step_id: str | None = None) -> dict | None:
         if step_id:
             row = self._query_one(

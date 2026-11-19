@@ -159,6 +159,7 @@ python -m labscribe serve    [--host 127.0.0.1] [--port 8000] [--agent llm]
 python -m labscribe eval     [--limit N] [--dataset path] [--no-report]
 python -m labscribe dataset  [--count 100] [--seed 20260101] [--out path]
 python -m labscribe trace <record_id>      # record → event → frame 全链路
+python -m labscribe ask "有没有超限的读数？"  # 基于归档数据问答（加 --llm 走模型）
 python -m labscribe pending [--status open]
 python -m labscribe stats
 ```
@@ -191,6 +192,9 @@ python -m labscribe stats
 | GET | `/api/stats` | 存储统计 |
 | GET | `/api/eval/latest` | 最近一次评测报告 JSON |
 | POST | `/api/ingest` | 手工注入事件（外部传感器/测试） |
+| GET | `/chat` | **实验档案问答页**（独立对话界面） |
+| POST | `/api/chat` | 基于归档数据回答问题，返回答案 + 引用来源 |
+| GET | `/api/chat/suggestions` | 随档案状态变化的推荐问题 |
 
 Dashboard 每 1.8s 轮询：事件卡片带缩略图，点击查看事件详情；记录点击查看「记录 → 事件 → 画面」追溯；
 待确认队列支持确认/拒绝；Agent 轨迹可展开每个工具的参数、结果与耗时；评测卡片展示最新指标。
@@ -200,6 +204,28 @@ Dashboard 每 1.8s 轮询：事件卡片带缩略图，点击查看事件详情�
 记录追溯弹窗：左侧是原始画面（`source_frame`），右侧是记录与事件 JSON，人工复核只需看一帧：
 
 ![Record trace](docs/trace.png)
+
+### 档案问答（`/chat`）
+
+独立的对话界面，用来问已经归档的数据：**最近做到哪一步、有没有超限、某一步的历史范围、告警原因**。
+
+![Archive chat](docs/chat.png)
+
+设计要点（`labscribe/chat.py`）：
+
+* **只读**：不写任何记录，不改 SOP 进度；
+* **先检索后回答**：先按关键词/步骤号/会话号/记录号从库里捞证据，再把证据喂给 LLM；
+* **只能引用，不能编造**：system prompt 明确禁止编造读数与编号，回答里必须带 `record_id` / `event_id`；
+* **统计由代码算**：`min/max/mean/样本数` 在入库前就计算好，模型只能引用，不能自己算；
+* **每条答案带来源**：右侧列出所有引用记录与告警，点开即可看到原始帧与完整 JSON；
+* **无 LLM 也能用**：没配 key 或调用失败时自动降级为纯检索模式，返回命中的记录列表。
+
+CLI 也可用：
+
+```powershell
+python -m labscribe ask "有没有超限的读数？"        # 纯检索
+python -m labscribe ask "S4 的历史范围是多少？" --llm  # 走模型
+```
 
 ---
 
@@ -470,7 +496,7 @@ SOP 文件位于 `data/sop/*.yaml`，包含步骤、仪器、指令与期望读�
 ## 测试
 
 ```text
-46 passed
+56 passed
 ```
 
 覆盖：
@@ -483,7 +509,8 @@ SOP 文件位于 `data/sop/*.yaml`，包含步骤、仪器、指令与期望读�
 * LLM 客户端（tool call 解析、非法参数、MockTransport 请求/鉴权）
 * API（启动/事件/记录/帧/追溯/会话/统计/手工注入/pending 确认触发 Agent）
 * 评测（100 条数据集契约、生成确定性、3 场景 smoke）
-* 运行时（完整 Demo 8 事件 / 8 记录 / 1 告警 / S1–S3 完成 / 全部帧可反查；连续运行不串会话）
+* **档案问答**（意图解析、检索命中、统计聚合、无 LLM 降级、空档案、LLM 失败降级、提示词只含检索证据、接口校验）
+* 运行时（完整 Demo 8 事件 / 8 记录 / 1 告警 / S1–S3 完成；连续运行不串会话）
 
 ---
 

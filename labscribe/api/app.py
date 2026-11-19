@@ -42,6 +42,16 @@ class IngestRequest(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatTurn(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    history: list[ChatTurn] = Field(default_factory=list)
+
+
 def create_app(cfg: Config | None = None, runtime: Runtime | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     rt = runtime or Runtime(cfg)
@@ -56,6 +66,11 @@ def create_app(cfg: Config | None = None, runtime: Runtime | None = None) -> Fas
     app = FastAPI(title="LabScribe", version=__version__, lifespan=lifespan)
     app.state.runtime = rt
     app.state.config = cfg
+
+    from ..chat import ArchiveChat
+
+    archive_chat = ArchiveChat(cfg, rt.db, rt.sops)
+    app.state.chat = archive_chat
 
     def get_rt(request: Request) -> Runtime:
         return request.app.state.runtime
@@ -245,6 +260,39 @@ def create_app(cfg: Config | None = None, runtime: Runtime | None = None) -> Fas
     @app.get("/api/stats")
     def stats(request: Request) -> dict[str, Any]:
         return get_rt(request).db.stats()
+
+    # -- archive chat ------------------------------------------------------
+    @app.get("/chat", response_class=HTMLResponse)
+    def chat_page() -> HTMLResponse:
+        path = STATIC_DIR / "chat.html"
+        if not path.exists():
+            raise HTTPException(status_code=500, detail="chat page missing")
+        return HTMLResponse(path.read_text(encoding="utf-8"))
+
+    @app.post("/api/chat")
+    def chat(req: ChatRequest, request: Request) -> dict[str, Any]:
+        chat_engine = request.app.state.chat
+        answer = chat_engine.ask(
+            req.question, [t.model_dump() for t in req.history]
+        )
+        return answer.to_dict()
+
+    @app.get("/api/chat/suggestions")
+    def chat_suggestions(request: Request) -> dict[str, Any]:
+        """Data-aware starter questions for the chat page."""
+        db = get_rt(request).db
+        stats = db.stats()
+        suggestions = [
+            "最近一次实验做到哪一步了？",
+            "有没有超限的读数？分别是哪几条记录？",
+            "S4 的历史读数范围是多少？",
+            "给我看一下最近 5 条实验记录。",
+        ]
+        if stats.get("alerts", 0):
+            suggestions.insert(1, "最近的告警是什么原因？")
+        if stats.get("records", 0) == 0:
+            suggestions = ["档案还是空的，怎么先生成一批数据？"]
+        return {"suggestions": suggestions, "has_data": stats.get("records", 0) > 0}
 
     @app.get("/api/eval/latest")
     def latest_eval(request: Request):

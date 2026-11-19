@@ -39,7 +39,6 @@ include = ["labscribe*"]
 
 [tool.setuptools.package-data]
 labscribe = ["api/static/*.html"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

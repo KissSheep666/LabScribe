@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import Config
 from .paths import resolve_path
 from .runtime import Runtime
+from .sop import SOPRegistry
 from .vision.synthetic import make_demo_scenario, make_scenario
 
 
@@ -269,6 +270,34 @@ def cmd_pending(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    from .chat import ArchiveChat
+    from .store import Database
+
+    cfg = Config.load(args.config)
+    db = Database(cfg.db_path)
+    sops = SOPRegistry(cfg.sop_dir)
+    chat = ArchiveChat(cfg, db, sops, use_llm=None if args.llm else False)
+    answer = chat.ask(args.question)
+    print(answer.answer)
+    if answer.mode == "search":
+        print("\n[检索模式]" + (f" {answer.error}" if answer.error else ""), file=sys.stderr)
+    if answer.sources:
+        print("\n--- 引用来源 ---", file=sys.stderr)
+        for s in answer.sources[:10]:
+            if s["kind"] == "alert":
+                print(f"  [{s['severity']}] {s['message'][:90]}  ({s.get('event_id')})", file=sys.stderr)
+            else:
+                print(
+                    f"  {s['record_id']}  {s.get('step_id') or '--':<3} "
+                    f"reading={s.get('reading')}  frame={s.get('source_frame')}",
+                    file=sys.stderr,
+                )
+        print(f"\n共 {len(answer.sources)} 条来源 · {answer.latency_ms:.0f} ms", file=sys.stderr)
+    db.close()
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     from .store import Database
 
@@ -333,6 +362,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", default="open")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=cmd_pending)
+
+    p = sub.add_parser("ask", help="ask a question about the archived experiment records")
+    p.add_argument("question")
+    p.add_argument("--llm", action="store_true", help="use the LLM instead of search-only mode")
+    p.set_defaults(func=cmd_ask)
 
     sub.add_parser("stats", help="print storage statistics").set_defaults(func=cmd_stats)
     return parser
