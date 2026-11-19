@@ -329,9 +329,37 @@ GET /api/records/{record_id}/trace  →  {record, event, frame{url}, agent_runs,
 | 遮挡 recall | **100%**（23/23） |
 | 帧处理耗时 | **1.26 ms/帧**（CPU） |
 
+**留出集**（换随机种子新生成 100 场景 / 442 事件，从未参与调参）：
+
+```powershell
+python -m labscribe dataset --seed 90909090 --count 100 --out data/eval/heldout.jsonl
+python -m labscribe eval --dataset data/eval/heldout.jsonl --no-report
+```
+
+| 指标 | 结果 |
+| --- | --- |
+| 事件 precision / recall / F1 | **100% / 100% / 100%**（442/442） |
+| `reading_change` | 139/139，平均延迟 0.89s |
+| `session_start` | 144/144，平均延迟 0.27s |
+| `session_end` | 144/144，平均延迟 0.02s |
+| `anomaly` | 15/15，平均延迟 0.91s |
+| 事件读数准确率 | **100%**（154 个读数） |
+| 遮挡 recall | **100%**（23/23） |
+| 帧处理耗时 | **1.43 ms/帧** |
+
+关于训练集/测试集的说明：
+
+* 本项目**不含需要训练的模型**（状态机为人工阈值、LLM 为现成模型、离线检测/OCR 为规则匹配），
+  因此**没有训练集**；现有 100 场景按用途属于**验证 + 测试**；
+* 若要引入学习型组件（微调检测器、步骤分类器），必须**按场景/机位/操作者分组**划分 train/val/test，
+  不能按帧随机分（相邻帧会泄漏）；
+* 最真实的一份标注其实已经在系统里：`pending` 队列的 `confirmed` / `rejected` 就是人工判断，
+  可导出为真实场景测试集（尚未实现，数据结构已具备）。
+
 > 诚实说明：该基准使用与渲染器同源的离线检测/OCR 后端，是为了让事件层、状态机与评测可复现，
 > **不代表真实摄像头上的模型精度**。生产环境应安装 YOLO11 + ByteTrack + PaddleOCR，并在真实
 > 标注数据上重新评测；`eval` 会记录所用后端（`system.detector/tracker/ocr`）。
+> 另外，该评测只覆盖「视觉 + 事件层」，**不覆盖 LLM 写记录的正确性**。
 
 ---
 
@@ -358,10 +386,11 @@ GET /api/records/{record_id}/trace  →  {record, event, frame{url}, agent_runs,
 想弄懂内部原理与完整链路，看这两份（内容相同，HTML 为简洁易读的单页版）：
 
 - Markdown：[`docs/architecture.md`](docs/architecture.md)
-- HTML：[`docs/architecture.html`](docs/architecture.html)（直接双击打开即可）
+- HTML：[`docs/architecture.html`](docs/architecture.html)（暗色主题 + 代码高亮，直接双击打开即可）
 
-内容包括：贯穿全文的类比、五层架构逐层拆解与核心代码、读数 7.2 的真实运行旅程（含原始帧）、
-异常链路、评测口径、设计取舍 FAQ（8 问）、代码地图与扩展方式。
+内容包括：术语速查、贯穿全文的类比、五层架构逐层拆解与核心代码、读数 7.2 的真实运行旅程（含原始帧）、
+异常链路、**数据集与评测（训练集/验证集/测试集概念、划分纪律、留出集结果、数据泄漏说明）**、
+设计取舍 FAQ（11 问）、代码地图与扩展方式。
 
 重新生成 HTML：
 
